@@ -139,6 +139,8 @@ class FeedTests(unittest.TestCase):
         self.fail_with = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "120"}, None)
         with mock.patch.object(ms, "fetch_json", self.fetch):
             self.assertIn("429", f.update())
+            self.assertIn("Retry-After 120", f.status()["last_error"])
+            self.assertEqual(f.status()["log"][-1]["path"], "/v1/items")
             self.t[0] += 100
             self.fail_with = None
             f2 = self.feed()                  # restart: the backoff is remembered

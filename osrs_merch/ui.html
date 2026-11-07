@@ -455,6 +455,14 @@ function renderBanner() {
       ". Uses the site's public API at its documented pace (once a minute)." }));
     if (fd.backoff_s > 0) parts.push(el("div", { className: "warn", textContent:
       `The price API asked us to slow down: pausing for ${ago(fd.backoff_s)}. Showing the last data received.` }));
+    if (fd.last_error) parts.push(el("div", { className: "warn", textContent: "Last error: " + fd.last_error }));
+    if (fd.log && fd.log.length) {
+      const d = el("details", {}, el("summary", { textContent: "Connection log", style: "cursor:pointer" }));
+      const pre = el("pre", { style: "margin:6px 0 0;font-size:12px;white-space:pre-wrap" });
+      pre.textContent = fd.log.slice(-12).map(e =>
+        `${new Date(e.t * 1000).toLocaleTimeString()}  ${e.path.padEnd(16)} ${String(e.ms).padStart(5)} ms  ${e.result}`).join("\n");
+      d.append(pre); parts.push(d);
+    }
   }
   for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
   b.append(...parts);
@@ -478,7 +486,7 @@ async function load(force = false) {
     if (!data || data.game !== game) { $("banner").textContent = "Couldn't load prices: " + e.message; $("rows").replaceChildren(); }
   } finally {
     inflight = false;
-    nextRefresh = Date.now() + 60000;
+    nextRefresh = Date.now() + (data ? 60000 : 15000);  // local only; the feed paces the real API
   }
 }
 

@@ -25,7 +25,8 @@ As a sanity check, a bond costs about 1m gp there versus about 9m on the main ga
 python3 osrs_merch/merch_scanner.py                  # opens the UI at http://127.0.0.1:8765 (Hardcore)
 python3 osrs_merch/merch_scanner.py --game osrs      # UI for the main-game economy (also: dmm)
 python3 osrs_merch/merch_scanner.py --cli --loop 60  # terminal table instead of the UI
-python3 osrs_merch/merch_scanner.py --debug "death rune"   # raw Hardcore server data for an item
+python3 osrs_merch/merch_scanner.py --debug "death rune"   # raw Hardcore data for an item
+python3 osrs_merch/merch_scanner.py --diagnose            # connection state, request log, health check
 cd osrs_merch && python3 -m unittest -v test_merch_scanner # run the tests
 ```
 

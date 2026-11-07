@@ -160,6 +160,27 @@ def hardcore_quotes(ua: str, raw: dict) -> list[Quote]:
     return out
 
 
+def describe_error(e: Exception) -> str:
+    """A one-line, human explanation of a failed request."""
+    code = getattr(e, "code", None)
+    if code is not None:
+        hdrs = getattr(e, "headers", None) or {}
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200].replace("\n", " ")
+        except Exception:
+            pass
+        hint = {429: "too many requests (rate limited)", 503: "server busy", 403: "forbidden (blocked)",
+                404: "not found"}.get(code, "")
+        ra = hdrs.get("Retry-After")
+        return f"HTTP {code} {hint}" + (f", Retry-After {ra}s" if ra else "") + (f", body: {body}" if body else "")
+    text = str(getattr(e, "reason", e))
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return ("SSL certificate error: run '/Applications/Python 3.*/Install Certificates.command' "
+                "(python.org installs on macOS need this once)")
+    return f"{type(e).__name__}: {text}"
+
+
 class RateLimited(Exception):
     pass
 
@@ -187,7 +208,7 @@ class HardcoreFeed:
         self.lock = threading.RLock()
         self.st = {"list": None, "list_at": 0, "fills": {}, "last_event": 0, "recent_at": 0,
                    "recent_stats": None, "swap": None, "swap_at": 0, "last_request": 0,
-                   "backoff_until": 0, "failures": 0}
+                   "backoff_until": 0, "failures": 0, "log": [], "last_error": None}
         try:
             self.st.update(json.loads(self.path.read_text()))
         except Exception:
@@ -211,6 +232,7 @@ class HardcoreFeed:
         try:
             data = fetch_json(f"{self.base}{path}", self.ua)
         except Exception as e:
+            self._log(path, now, error=e)
             if getattr(e, "code", None) in (429, 503):
                 retry = 0
                 try:
@@ -221,9 +243,21 @@ class HardcoreFeed:
                 self.st["failures"] += 1
                 self.st["backoff_until"] = now + wait
             raise
+        self._log(path, now)
         self.st["failures"] = 0
         self.st["backoff_until"] = 0
+        self.st["last_error"] = None
         return data
+
+    def _log(self, path: str, started: float, error: Exception | None = None):
+        """Keep the last 25 requests (time, path, result) for the debug views."""
+        entry = {"t": int(started), "path": path.split("?")[0], "ms": int((self.clock() - started) * 1000)}
+        if error is None:
+            entry["result"] = "ok"
+        else:
+            entry["result"] = describe_error(error)
+            self.st["last_error"] = f"{entry['path']}: {entry['result']}"
+        self.st["log"] = (self.st.get("log") or [])[-24:] + [entry]
 
     def _ingest(self, recent: dict):
         """Fold a /v1/recent page into per-item live prices."""
@@ -297,6 +331,8 @@ class HardcoreFeed:
             "live_items": len(self.st["fills"]),
             "reporters24": stats.get("reporters24"),
             "backoff_s": int(max(0, self.st["backoff_until"] - now)),
+            "last_error": self.st.get("last_error"),
+            "log": self.st.get("log") or [],
         }
 
 
@@ -383,7 +419,12 @@ def scan(game: str, ua: str = DEFAULT_UA, force: bool = False, feed: HardcoreFee
         if w:
             warnings.append(w)
         if not feed.st["list"]:
-            raise RuntimeError(w or "No Hardcore data yet; it arrives within a few seconds.")
+            st = feed.status()
+            why = w or (f"last error: {st['last_error']}" if st["last_error"] else None)
+            if st["backoff_s"]:
+                why = f"paused for {st['backoff_s']}s after: {st['last_error']}"
+            raise RuntimeError("No Hardcore data yet" + (f" ({why})" if why else "; it arrives within a few seconds")
+                               + ". Run: python3 osrs_merch/merch_scanner.py --diagnose")
         quotes = hardcore_quotes(ua, raw={"items": feed.items()})
         status, swap = feed.status(), feed.st.get("swap")
         server_time = status["list_server_time"]
@@ -433,6 +474,45 @@ def render(flips, top: int) -> str:
             f"{fmt_gp(f.margin):>8}{f.roi*100:>6.1f}%{(f.limit or 0):>7}{fmt_gp(f.vol_24h):>8}"
             f"{fmt_gp(f.potential):>9}{fmt_age(f.age_s):>6}")
     return "\n".join(lines)
+
+
+def run_diagnose(args) -> int:
+    """Explain the connection to the Hardcore API: saved state, recent requests, one live health check."""
+    feed = get_feed(args.user_agent)
+    now = int(time.time())
+    st = feed.status()
+    print(f"Python {sys.version.split()[0]} on {sys.platform}; state file {feed.path} "
+          f"({'exists' if feed.path.exists() else 'not created yet'})")
+    print(f"API base: {feed.base}")
+    print(f"Item list: {'fetched ' + fmt_age(st['list_age_s']) + ' ago' if st['list_age_s'] is not None else 'NEVER fetched'}"
+          f"; live items: {st['live_items']}")
+    print(f"Backoff: {'paused ' + fmt_age(st['backoff_s']) if st['backoff_s'] else 'none'}"
+          f"; last error: {st['last_error'] or 'none'}")
+    if st["log"]:
+        print("\nRecent requests (newest last):")
+        for e in st["log"][-12:]:
+            print(f"  {fmt_age(max(0, now - e['t'])):>5} ago  {e['path']:<16} {e['ms']:>5} ms  {e['result']}")
+    print("\nLive check (GET /v1/health, the cheapest endpoint):")
+    if st["backoff_s"]:
+        print(f"  skipped: still paused for {st['backoff_s']}s (asking now would only extend the lockout)")
+    else:
+        t0 = time.time()
+        try:
+            data, hdrs = fetch_json_headers(f"{feed.base}/v1/health", args.user_agent)
+            print(f"  OK in {int((time.time() - t0) * 1000)} ms: {data}")
+            print(f"  server clock vs yours: {int(data.get('time', now)) - now:+d}s" if isinstance(data, dict) else "")
+        except Exception as e:
+            print(f"  FAILED: {describe_error(e)}")
+    print("\nWhat it means:")
+    if st["backoff_s"] or "429" in (st["last_error"] or ""):
+        print("  The API is rate limiting your IP. Stop all scanner copies, wait out the pause, start ONE copy.")
+    elif st["list_age_s"] is None and st["last_error"]:
+        print("  The item list has never loaded: see the last error above (network, SSL, or blocked).")
+    elif st["list_age_s"] is None:
+        print("  Nothing has been requested yet. Start the scanner (one copy) and give it a minute.")
+    else:
+        print("  Connection looks fine.")
+    return 0
 
 
 def run_debug(args) -> int:
@@ -593,8 +673,11 @@ def main(argv=None):
     ap.add_argument("--f2p", action="store_true", help="(cli) free-to-play items only")
     ap.add_argument("--loop", type=int, metavar="SECONDS", help="(cli) rescan every N seconds")
     ap.add_argument("--debug", metavar="NAME", help="print raw Hardcore server data for items matching NAME")
+    ap.add_argument("--diagnose", action="store_true", help="explain the connection to the Hardcore API")
     ap.add_argument("--user-agent", default=DEFAULT_UA)
     args = ap.parse_args(argv)
+    if args.diagnose:
+        return run_diagnose(args)
     if args.debug:
         return run_debug(args)
     return run_cli(args) if args.cli else run_ui(args)
