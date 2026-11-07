@@ -18,6 +18,7 @@ As a sanity check, a bond costs about 1m gp there versus about 9m on the main ga
 | `merch_scanner.py` | Everything in Python, stdlib only (no pip installs): fetching, analysis, terminal output, and a local web server for the UI. |
 | `ui.html` | Single-page browser UI, plain HTML/CSS/JS with no frameworks, served by `merch_scanner.py`. |
 | `test_merch_scanner.py` | unittest tests. They mock `fetch_json`, so they need no network. |
+| `hardcore_overlay.user.js` | **Recommended for Hardcore.** A Tampermonkey userscript for hardcore.malkana.dev. It wraps `window.fetch`/XHR to read copies of the `/v1/items` and `/v1/recent` responses the page already loads, and draws a 'Merch overlay' panel (recommendations, budget, slots, margin checks). It makes zero requests to the site, so it can't hit rate limits. Its only other request is the Wiki mapping, once a day. State lives in localStorage (`hcMerch:*`). Its logic mirrors `merch_scanner.py`, so keep them in sync. |
 | `HANDOFF.md` | This file. |
 
 ## Running it (macOS: use `python3`, not `python`)
