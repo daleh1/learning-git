@@ -31,8 +31,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 WIKI = "https://prices.runescape.wiki/api/v1"
-HC_SERVER = "https://hardcore-ge-tracker-107023686748.europe-north1.run.app"
-HC_ECONOMY = 9000  # the plugin's fixed economy id for all Hardcore Worlds
+# The Hardcore World Tool Kit public data API, documented at https://hardcore.malkana.dev/docs
+# (open, no key; answers are cached for up to a minute; clients that ask far too often get 429/503).
+# Rules we follow: each endpoint at most once a minute, never the site's paid "pro" endpoints, and
+# no real-world trading use (their terms). Contact: Discord @Novith.
+HC_SITE = "https://hardcore.malkana.dev"
 GAMES = ("hardcore", "osrs", "dmm")
 
 # GE tax: 2% of the sell price, rounded down, capped at 5m; items sold below 50 gp
@@ -101,7 +104,7 @@ class Flip:
     asks: int
     trusted_price: int | None
     avg_margin: int | None = None  # margin using 24h averages: a steadier sanity check
-    live: bool = False             # prices from the frequently refreshed shortlist
+    live: bool = False             # prices from the live trade feed
 
 
 # ---------------------------------------------------------------- fetching
@@ -162,30 +165,29 @@ class RateLimited(Exception):
 
 
 class HardcoreFeed:
-    """Polite access to the Hardcore price server, which rate-limits per IP address.
+    """Hardcore prices from the public data API, within its documented limits.
 
-    - The full item list is only an (about hourly) snapshot, so it is fetched rarely (LIST_EVERY).
-    - The best few candidates (SHORTLIST) are refreshed in ONE batched /v1/items?ids=... request,
-      the same call the RuneLite plugin makes, every LIVE_EVERY seconds.
-    - At most one request per update() call, never two within MIN_GAP seconds, and after a 429/503
-      we back off like the plugin does (Retry-After, else 30 s doubling to 5 min).
-    - State (data, timers, backoff) is saved to disk so restarting the scanner doesn't refetch.
+    - /v1/items: every item's summary (the per-item prices in it lag ~40 min), every LIST_EVERY seconds.
+    - /v1/recent?kinds=fill&limit=200&after=<newest id seen>: the LIVE feed of trades, once a minute.
+      Each fill updates that item's live buy/sell price, so actively traded items get current prices
+      on top of the delayed list. `after` means we only ever receive what is new.
+    - At most one request per update() call and never two within MIN_GAP seconds; 429/503 back off
+      (Retry-After, else 30 s doubling to 5 min). State is saved to disk so restarts don't refetch.
     """
-    LIST_EVERY = 60 * 60   # the list is an ~hourly snapshot; fetching it more often gains nothing
-    LIVE_EVERY = 5 * 60
-    SWAP_EVERY = 3 * 60 * 60
-    MIN_GAP = 60
-    QUIET_FOR = 24 * 60 * 60  # after a long lockout, stop the shortlist polling for a day
-    SHORTLIST = 10
+    LIST_EVERY = 5 * 60
+    RECENT_EVERY = 60        # the API caches answers for a minute: asking faster gains nothing
+    SWAP_EVERY = 60 * 60
+    MIN_GAP = 20
+    FILL_TTL = 2 * 60 * 60   # forget live fills older than this
 
-    def __init__(self, ua: str = DEFAULT_UA, state_path: Path | None = None, base: str = HC_SERVER,
+    def __init__(self, ua: str = DEFAULT_UA, state_path: Path | None = None, base: str = HC_SITE,
                  clock=time.time):
         self.ua, self.base, self.clock = ua, base, clock
-        self.path = state_path or Path.home() / ".osrs_merch_state.json"
-        self.lock = threading.Lock()
-        self.st = {"list": None, "list_at": 0, "live": {}, "live_at": 0, "live_ids": [],
-                   "swap": None, "swap_at": 0, "last_request": 0, "backoff_until": 0, "failures": 0,
-                   "quiet_until": 0}
+        self.path = state_path or Path.home() / ".osrs_merch_state_v3.json"
+        self.lock = threading.RLock()
+        self.st = {"list": None, "list_at": 0, "fills": {}, "last_event": 0, "recent_at": 0,
+                   "recent_stats": None, "swap": None, "swap_at": 0, "last_request": 0,
+                   "backoff_until": 0, "failures": 0}
         try:
             self.st.update(json.loads(self.path.read_text()))
         except Exception:
@@ -209,89 +211,93 @@ class HardcoreFeed:
         try:
             data = fetch_json(f"{self.base}{path}", self.ua)
         except Exception as e:
-            code = getattr(e, "code", None)
-            if code in (429, 503):
+            if getattr(e, "code", None) in (429, 503):
                 retry = 0
                 try:
                     retry = int((getattr(e, "headers", None) or {}).get("Retry-After") or 0)
                 except (TypeError, ValueError):
                     pass
                 wait = max(min(30 * 2 ** min(self.st["failures"], 4), 300), min(retry, 3600))
-                if retry >= 600:
-                    # A long Retry-After is the operator telling us to back right off: from now on only
-                    # fetch the hourly list, no shortlist polling.
-                    self.st["quiet_until"] = now + self.QUIET_FOR
                 self.st["failures"] += 1
                 self.st["backoff_until"] = now + wait
-            self._save()
             raise
         self.st["failures"] = 0
         self.st["backoff_until"] = 0
         return data
 
-    def update(self, shortlist: list[int] | None = None, force_live: bool = False) -> str | None:
+    def _ingest(self, recent: dict):
+        """Fold a /v1/recent page into per-item live prices."""
+        fills = self.st["fills"]
+        for ev in recent.get("events") or []:
+            if ev.get("kind") != "fill" or not ev.get("price") or not ev.get("ts"):
+                continue
+            self.st["last_event"] = max(self.st["last_event"], int(ev.get("id") or 0))
+            f = fills.setdefault(str(ev["itemId"]), {"name": ev.get("name"), "n": 0})
+            # side "buy": someone bought at this price (your sell target); "sell": someone sold (your buy target)
+            key = "buy" if ev.get("side") == "buy" else "sell"
+            if ev["ts"] >= f.get(key + "Ts", 0):
+                f[key], f[key + "Ts"] = int(ev["price"]), int(ev["ts"])
+            f["n"] += 1
+        cutoff = self.clock() - self.FILL_TTL
+        for k in [k for k, f in fills.items() if max(f.get("buyTs", 0), f.get("sellTs", 0)) < cutoff]:
+            del fills[k]
+        self.st["recent_stats"] = recent.get("stats")
+
+    def update(self, force: bool = False) -> str | None:
         """Make at most one request, if one is due and allowed. Returns a warning, if any."""
         with self.lock:
             if self.blocked_for() > 0:
                 return None
             now = self.clock()
-            q = f"world={HC_ECONOMY}&include=trust,fill"
             try:
                 if not self.st["list"] or now - self.st["list_at"] >= self.LIST_EVERY:
-                    self.st["list"] = self._get(f"/v1/items?{q}")
+                    self.st["list"] = self._get("/v1/items?include=fill,trust")
                     self.st["list_at"] = now
-                elif shortlist and now >= self.st.get("quiet_until", 0) and (
-                        force_live or now - self.st["live_at"] >= self.LIVE_EVERY):
-                    ids = ",".join(str(i) for i in sorted(set(shortlist))[: self.SHORTLIST])
-                    resp = self._get(f"/v1/items?ids={ids}&{q}")
-                    self.st["live"] = {str(it["id"]): it for it in resp.get("items") or []}
-                    self.st["live_ids"] = sorted(set(shortlist))[: self.SHORTLIST]
-                    self.st["live_at"] = now
-                    self.st["live_time"] = resp.get("time")
+                elif now - self.st["recent_at"] >= (self.MIN_GAP if force else self.RECENT_EVERY):
+                    after = f"&after={self.st['last_event']}" if self.st["last_event"] else ""
+                    self._ingest(self._get(f"/v1/recent?kinds=fill&limit=200{after}"))
+                    self.st["recent_at"] = now
                 elif now - self.st["swap_at"] >= self.SWAP_EVERY:
                     self.st["swap_at"] = now
-                    self.st["swap"] = self._get(f"/v1/swap-rate?world={HC_ECONOMY}")
+                    self.st["swap"] = self._get("/v1/swap-rate")
             except RateLimited as e:
                 return str(e)
             except Exception as e:
-                code = getattr(e, "code", None)
-                return (f"Price server said 429 Too Many Requests; pausing {self.blocked_for()}s."
-                        if code == 429 else f"Price server request failed: {e}")
+                return (f"Price site said 429 Too Many Requests; pausing {self.blocked_for()}s."
+                        if getattr(e, "code", None) == 429 else f"Price site request failed: {e}")
             finally:
                 self._save()
             return None
 
     def items(self) -> list[dict]:
-        """The full list with the fresher shortlist entries laid over it (each marked live=True)."""
-        merged = {str(it["id"]): it for it in (self.st["list"] or {}).get("items") or []}
-        if self.clock() - self.st["live_at"] < 3 * self.LIVE_EVERY:  # don't trust old "live" data
-            for k, it in self.st["live"].items():
-                merged[k] = dict(it, live=True)
-        return list(merged.values())
+        """The delayed list, with any newer live fill prices laid over it (marked live=True)."""
+        with self.lock:
+            merged = {str(it["id"]): dict(it) for it in (self.st["list"] or {}).get("items") or []}
+            for k, f in self.st["fills"].items():
+                it = merged.get(k)
+                if it is None:
+                    continue
+                for side, field, fill in (("buy", "lastBuy", "lastFillBuy"), ("sell", "lastSell", "lastFillSell")):
+                    seen = max(it.get(field + "Time") or 0, it.get(fill + "Time") or 0)
+                    if f.get(side + "Ts", 0) > seen:
+                        it[field], it[field + "Time"] = f[side], f[side + "Ts"]
+                        it[fill], it[fill + "Time"] = f[side], f[side + "Ts"]
+                        it["live"] = True
+            return list(merged.values())
 
     def status(self) -> dict:
         now = self.clock()
         lst = self.st["list"] or {}
+        stats = self.st.get("recent_stats") or {}
         return {
             "list_age_s": int(now - self.st["list_at"]) if self.st["list_at"] else None,
             "list_server_time": lst.get("time"),
             "next_list_s": max(0, int(self.st["list_at"] + self.LIST_EVERY - now)),
-            "live_age_s": int(now - self.st["live_at"]) if self.st["live_at"] else None,
-            "live_server_time": self.st.get("live_time"),
-            "next_live_s": max(0, int(self.st["live_at"] + self.LIVE_EVERY - now)),
-            "live_count": len(self.st["live"]),
+            "recent_age_s": int(now - self.st["recent_at"]) if self.st["recent_at"] else None,
+            "live_items": len(self.st["fills"]),
+            "reporters24": stats.get("reporters24"),
             "backoff_s": int(max(0, self.st["backoff_until"] - now)),
-            "quiet_s": int(max(0, self.st.get("quiet_until", 0) - now)),
         }
-
-
-def pick_shortlist(flips: list["Flip"], n: int) -> list[int]:
-    """Best n candidates by a conservative profit estimate: the ones worth fresh prices."""
-    d = DEFAULTS["hardcore"]
-    good = [f for f in flips if f.margin > 0 and f.vol_24h >= d["min_volume"] and f.roi <= d["max_roi"]
-            and (f.avg_margin is None or f.avg_margin > 0)]
-    score = lambda f: (min(f.margin, f.avg_margin) if f.avg_margin is not None else f.margin) * f.max_units
-    return [f.item_id for f in sorted(good, key=score, reverse=True)[:n]]
 
 
 _mapping_cache: dict = {}
@@ -373,13 +379,11 @@ def scan(game: str, ua: str = DEFAULT_UA, force: bool = False, feed: HardcoreFee
     status, swap, server_time = None, None, None
     if game == "hardcore":
         feed = feed or get_feed(ua)
-        # Pick the shortlist from what we already have, then let the feed make at most one request.
-        current = build_flips(hardcore_quotes(ua, raw={"items": feed.items()}), mapping, now)
-        w = feed.update(pick_shortlist(current, feed.SHORTLIST), force_live=force)
+        w = feed.update(force=force)
         if w:
             warnings.append(w)
         if not feed.st["list"]:
-            raise RuntimeError(w or "No Hardcore data yet; waiting for the rate limit to clear.")
+            raise RuntimeError(w or "No Hardcore data yet; it arrives within a few seconds.")
         quotes = hardcore_quotes(ua, raw={"items": feed.items()})
         status, swap = feed.status(), feed.st.get("swap")
         server_time = status["list_server_time"]
@@ -432,32 +436,27 @@ def render(flips, top: int) -> str:
 
 
 def run_debug(args) -> int:
-    """Show the polite feed's state and the data it holds for items matching a name. Makes at most
-    one request, and only if the rate limiter allows it."""
+    """Show the feed's state and the data it holds for items matching a name (one request at most)."""
     feed = get_feed(args.user_agent)
-    w = feed.update(None)
+    w = feed.update()
     now = int(time.time())
     st = feed.status()
     print(f"Your clock: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}   state file: {feed.path}")
     if w:
         print(f"! {w}")
-    print(f"Backoff: {st['backoff_s']}s remaining" if st["backoff_s"] else "Backoff: none (not rate limited)")
+    print(f"Backoff: {st['backoff_s']}s remaining" if st["backoff_s"] else "Backoff: none")
     lt = st["list_server_time"]
-    print(f"Full list:  fetched {fmt_age(st['list_age_s']) + ' ago' if st['list_age_s'] is not None else 'never'}"
-          + (f", server snapshot {fmt_age(now - lt)} old" if lt else ""))
-    vt = st["live_server_time"]
-    print(f"Shortlist:  {st['live_count']} items, fetched "
-          f"{fmt_age(st['live_age_s']) + ' ago' if st['live_age_s'] is not None else 'never'}"
-          + (f", server snapshot {fmt_age(now - vt)} old" if vt else ""))
+    print(f"Item list: fetched {fmt_age(st['list_age_s']) + ' ago' if st['list_age_s'] is not None else 'never'}"
+          + (f", site snapshot {fmt_age(now - lt)} old" if lt else ""))
+    print(f"Live feed: {st['live_items']} items with live prices, polled "
+          f"{fmt_age(st['recent_age_s']) + ' ago' if st['recent_age_s'] is not None else 'never'}")
     want = args.debug.lower()
     for it in feed.items():
         if want in (it.get("name") or "").lower():
             print(("\n[LIVE] " if it.get("live") else "\n[LIST] ") + json.dumps(it, indent=2))
             for k, v in it.items():
                 if k.endswith("Time") and v:
-                    print(f"  {k:<18} = {fmt_age(max(0, now - int(v)))} ago")
-    print("\nIf the shortlist snapshot is much fresher than the full list, live prices work; "
-          "if both are ~1h old, the server delays all public data.")
+                    print(f"  {k:<14} = {fmt_age(max(0, now - int(v)))} ago")
     return 0
 
 
@@ -557,7 +556,18 @@ def make_handler(cache: Cache):
     return Handler
 
 
+def _feed_pump(ua: str):
+    while True:
+        try:
+            get_feed(ua).update()
+        except Exception:
+            pass
+        time.sleep(15)
+
+
 def run_ui(args) -> int:
+    if args.game == "hardcore":
+        threading.Thread(target=_feed_pump, args=(args.user_agent,), daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(Cache(args.user_agent)))
     url = f"http://127.0.0.1:{server.server_address[1]}/?game={args.game}"
     print(f"Merch scanner running at {url}  (Ctrl+C to stop)")

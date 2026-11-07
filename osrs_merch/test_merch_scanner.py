@@ -30,7 +30,6 @@ def fake_fetch(url, *a, **k):
     if url.endswith("/osrs/mapping"):
         return MAPPING
     if "/v1/items" in url:
-        assert "world=9000" in url
         return HC_ITEMS
     if "/v1/swap-rate" in url:
         return {"rate": 0.11, "main": 9_000_000, "hardcore": 1_000_000}
@@ -75,7 +74,7 @@ class Tests(unittest.TestCase):
         self.assertEqual({f.item_id: f.max_units for f in flips}, {1: 2, 2: 0})
 
     def test_ui_server_serves_page_and_api(self):
-        ms._feed = ms.HardcoreFeed("ua", Path(tempfile.mkdtemp()) / "state.json")
+        ms._feed = ms.HardcoreFeed("ua", Path(tempfile.mkdtemp()) / "state.json", base="https://site")
         with mock.patch.object(ms, "fetch_json", fake_fetch):
             srv = ms.ThreadingHTTPServer(("127.0.0.1", 0), ms.make_handler(ms.Cache("ua")))
             threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -100,67 +99,62 @@ class FeedTests(unittest.TestCase):
         self.calls.append(url)
         if self.fail_with:
             raise self.fail_with
-        if "ids=" in url:
-            return {"time": NOW, "items": [dict(HC_ITEMS["items"][0], lastFillBuy=310_000)]}
+        if "/v1/recent" in url:
+            return {"stats": {"reporters24": 2500}, "events": [
+                {"id": 7, "kind": "fill", "side": "buy", "itemId": 1, "price": 305_000, "ts": NOW + 5},
+                {"id": 8, "kind": "fill", "side": "sell", "itemId": 1, "price": 279_000, "ts": NOW + 6},
+                {"id": 9, "kind": "fill", "side": "buy", "itemId": 1, "price": 999, "ts": NOW - 99999},  # older: ignored
+            ]}
         if "swap-rate" in url:
             return {"main": 9_000_000, "hardcore": 1_000_000}
         return HC_ITEMS
 
     def feed(self):
-        return ms.HardcoreFeed("ua", self.state, clock=lambda: self.t[0])
+        return ms.HardcoreFeed("ua", self.state, base="https://site", clock=lambda: self.t[0])
 
-    def test_one_request_per_update_and_spacing(self):
+    def test_schedule_and_live_overlay(self):
         f = self.feed()
         with mock.patch.object(ms, "fetch_json", self.fetch):
-            f.update([1, 2])                  # first: the full list
-            f.update([1, 2])                  # too soon: nothing
+            f.update()                        # the list
+            f.update()                        # too soon: nothing
             self.t[0] += f.MIN_GAP
-            f.update([1, 2])                  # shortlist, batched in one request
+            f.update()                        # live feed
             self.t[0] += f.MIN_GAP
-            f.update([1, 2])                  # live not due yet -> swap rate
-            self.t[0] += f.MIN_GAP
-            f.update([1, 2])                  # nothing due
-        self.assertEqual(len(self.calls), 3)
-        self.assertIn("ids=1,2&", self.calls[1])
-        live = {it["id"]: it for it in f.items()}
-        self.assertTrue(live[1]["live"])
-        self.assertEqual(live[1]["lastFillBuy"], 310_000)
-        self.assertNotIn("live", live[2])
+            f.update()                        # feed not due -> swap rate
+            self.t[0] += f.RECENT_EVERY
+            f.update()                        # feed due again
+        self.assertEqual([u.split("/v1/")[1].split("?")[0] for u in self.calls],
+                         ["items", "recent", "swap-rate", "recent"])
+        items = {it["id"]: it for it in f.items()}
+        self.assertTrue(items[1]["live"])
+        self.assertEqual((items[1]["lastBuy"], items[1]["lastSell"]), (305_000, 279_000))
+        q = {x.item_id: x for x in ms.hardcore_quotes("ua", {"items": f.items()})}
+        self.assertEqual((q[1].sell_ref, q[1].buy_ref), (305_000, 279_000))
+        self.assertNotIn("live", items[2])
+        self.assertIn("after=9", self.calls[-1])  # only ask for what is new
+        self.assertEqual(f.status()["live_items"], 1)
 
     def test_429_backs_off_and_persists(self):
         f = self.feed()
         self.fail_with = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "120"}, None)
         with mock.patch.object(ms, "fetch_json", self.fetch):
-            w = f.update([1])
-            self.assertIn("429", w)
+            self.assertIn("429", f.update())
             self.t[0] += 100
             self.fail_with = None
             f2 = self.feed()                  # restart: the backoff is remembered
-            f2.update([1])
+            f2.update()
             self.assertEqual(len(self.calls), 1)
             self.t[0] += 30
-            f2.update([1])
+            f2.update()
             self.assertEqual(len(self.calls), 2)
 
-    def test_long_retry_after_turns_off_shortlist(self):
+    def test_old_fills_expire(self):
         f = self.feed()
         with mock.patch.object(ms, "fetch_json", self.fetch):
-            f.update([1])                     # list ok
-            self.t[0] += f.MIN_GAP
-            self.fail_with = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "1800"}, None)
-            f.update([1])                     # shortlist -> long lockout
-            self.fail_with = None
-            self.t[0] += 1800
-            f.update([1])                     # quiet: no shortlist; swap rate instead
-        self.assertNotIn("ids=", self.calls[-1])
-        self.assertGreater(f.status()["quiet_s"], 0)
-
-    def test_shortlist_skips_negative_average(self):
-        with mock.patch.object(ms, "fetch_json", fake_fetch):
-            ms._mapping_cache.clear()
-            flips = ms.build_flips(ms.hardcore_quotes("ua", HC_ITEMS), ms.wiki_mapping("ua"), NOW)
-        flips[1].avg_margin = -5
-        self.assertEqual(ms.pick_shortlist(flips, 5), [flips[0].item_id])
+            f.update(); self.t[0] += f.MIN_GAP; f.update()
+            self.t[0] += f.FILL_TTL + 60
+            f._ingest({"events": []})
+        self.assertEqual(f.st["fills"], {})
 
 
 if __name__ == "__main__":

@@ -30,26 +30,21 @@ cd osrs_merch && python3 -m unittest -v test_merch_scanner # run the tests
 ```
 
 ## Data sources
-**Hardcore Worlds** (`--game hardcore`, the default) use the community "Hardcore World Tool
-Kit" RuneLite plugin server (https://github.com/Novafifth/hardcore-world-tool-kit). The
-data comes only from players who run that plugin and opted in to sharing, so it is thin
-and partial. Reads are plain unauthenticated GETs, and the tool must stay polite: at most
-one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
-- Base URL: `https://hardcore-ge-tracker-107023686748.europe-north1.run.app`
-- Every request takes `world=9000`, the fixed economy id the plugin uses for all Hardcore
-  Worlds, and `include=trust,fill`.
-- `GET /v1/items?world=9000&include=trust,fill` returns `{"time": <unix s>, "items": [ItemSummary...]}`.
-  Each ItemSummary has: `id, name, lastBuy, lastBuyTime, lastSell, lastSellTime, bestBid, bestAsk,
-  bids, asks, vol24, trustedPrice, trustedVotes, trustedPriceTime, confVol24, unconfVol24,
-  trustedBestBid, trustedBestAsk, lastFillBuy, lastFillBuyTime, lastFillSell, lastFillSellTime`.
-  Timestamps are **unix seconds**. The `lastFill*` fields are live fills. Plain `last*` can come
-  from imported GE-history rows, which have no real time, so the code prefers `lastFill*`.
-- `GET /v1/item/{id}?world=9000&limit=40` gives one item's detail: summary, order book, recent trades.
-- `GET /v1/item/{id}/series?world=9000&range=24h|7d|30d|90d|1y&step=5m|1h|6h|24h` gives price history.
-- `GET /v1/recent?world=9000&limit=60&kinds=fill` is the feed of recent trades.
-- `GET /v1/swap-rate?world=9000` returns `{rate, rateLow, rateHigh, main, hardcore}`, the bond price in each economy.
-- These shapes were taken from the plugin's Java source (`MarketClient.java`, `MarketData.java`)
-  and **have not been verified against the live server yet**.
+**Hardcore Worlds** (`--game hardcore`, the default) use the **official public data API** of the
+"Hardcore World Tool Kit" project. It is documented at https://hardcore.malkana.dev/docs (guide:
+`/docs/guide`, spec: `/openapi.json`). It is open, needs no key and allows CORS. Answers are cached
+for up to a minute, and a client that asks "far too often" gets a 429/503, sometimes with a
+Retry-After of 1800 s. The data comes only from players running the RuneLite plugin.
+- Base: `https://hardcore.malkana.dev`. The old direct backend (`...run.app`) and the `world=9000` param are no longer used.
+- `GET /v1/items?include=fill,trust[&ids=up to 100]` returns `{time, world, items:[...]}`. The per-item
+  prices in this list lag about 40 min. Fields: `id, name, vol24, gp24, reporters24, bids, asks, avgBuy24,
+  avgSell24, lastBuy(+Time), lastSell(+Time), bestBid, bestAsk, bidQty, askQty`, plus `lastFill*` and trust fields.
+- `GET /v1/recent?kinds=fill&limit=1..200&after=<event id>` is the **live** feed of trades:
+  `{time, stats:{reporters24,...}, events:[{id, kind, side, itemId, name, qty, price, ts, ...}]}`.
+  A `side` of "buy" means someone bought at that price, which is your sell target.
+- `GET /v1/item/{id}`, `/v1/item/{id}/series`, `/v1/swap-rate`, `/v1/swap-rate/history` and `/v1/health` also exist.
+- **Never call `/v1/pro/*`.** That is the site's paid product, and the terms forbid getting around plan
+  limits or scraping the tools. The terms also forbid real-world trading (RWT) use.
 
 **Main game / Deadman** (`--game osrs|dmm`) use the OSRS Wiki real-time prices API:
 `https://prices.runescape.wiki/api/v1/{osrs|dmm}/latest`, `/24h` and `/mapping`.
@@ -98,18 +93,14 @@ one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
   tax and margin are recomputed in JS (`effective()`). JS `tax()` mirrors Python `ge_tax()`, so keep them in sync.
 - `scan()` returns unprofitable items too (`keep_unprofitable=True`), so a check can bring them back.
   The UI and CLI filter on `margin > 0`.
-- The server rate-limits per IP (HTTP 429). All Hardcore requests go through `HardcoreFeed`.
-  It fetches the full list every 60 min (it is an ~hourly snapshot anyway), and refreshes the top
-  10 candidates (`pick_shortlist`) with ONE batched `/v1/items?ids=...` call every 5 min. It sends
-  the swap rate hourly, makes at most one request per `update()` and never two within 60 s, and backs
-  off on 429/503 the same way the plugin does. Its state is saved to `~/.osrs_merch_state.json`, so
-  restarts don't refetch.
-  If the server sends Retry-After >= 10 min (it has sent 1800 s), the shortlist polling is switched off for 24 h.
-  The server is a community project built for plugin users, not a public API. Don't try to get around its limits
-  (no spoofed User-Agents, proxies or IP rotation). Ask the developer via the plugin's Discord instead. The Refresh button forces only the shortlist, and that is still throttled.
+- `HardcoreFeed` is the only code that talks to the Hardcore API. It fetches `/v1/items` every
+  5 min and `/v1/recent` (incremental via `after`) every 60 s, making at most one request per `update()`
+  and never two within 20 s. It backs off on 429/503, using Retry-After if given, else 30 s doubling to
+  5 min. Live fills are laid over the delayed list in `items()`, and those items are marked `live`.
+  In UI mode a background thread calls `update()` every 15 s. State is saved to `~/.osrs_merch_state_v3.json`.
 
 ## Known issues / open questions (current work)
-1. **Trade ages look too old (diagnosed: server data ~58 min behind; user clock verified correct).** Every item's last trade seems to be at least about 40 minutes
+1. **Trade ages look too old.** Diagnosed: the `/v1/items` prices lag about 40–60 min, and the user's clock is correct. The fix is the live `/v1/recent` overlay. Every item's last trade seems to be at least about 40 minutes
    old, even for busy items. Possible causes:
    - (a) few plugin users;
    - (b) the server publishes with a delay or caches its answers;
