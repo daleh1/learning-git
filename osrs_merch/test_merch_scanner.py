@@ -142,6 +142,19 @@ class FeedTests(unittest.TestCase):
             f2.update([1])
             self.assertEqual(len(self.calls), 2)
 
+    def test_long_retry_after_turns_off_shortlist(self):
+        f = self.feed()
+        with mock.patch.object(ms, "fetch_json", self.fetch):
+            f.update([1])                     # list ok
+            self.t[0] += f.MIN_GAP
+            self.fail_with = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "1800"}, None)
+            f.update([1])                     # shortlist -> long lockout
+            self.fail_with = None
+            self.t[0] += 1800
+            f.update([1])                     # quiet: no shortlist; swap rate instead
+        self.assertNotIn("ids=", self.calls[-1])
+        self.assertGreater(f.status()["quiet_s"], 0)
+
     def test_shortlist_skips_negative_average(self):
         with mock.patch.object(ms, "fetch_json", fake_fetch):
             ms._mapping_cache.clear()

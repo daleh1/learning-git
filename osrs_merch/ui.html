@@ -455,6 +455,8 @@ function renderBanner() {
       ". Requests are spaced out to stay under the server's rate limit." }));
     if (fd.backoff_s > 0) parts.push(el("div", { className: "warn", textContent:
       `Rate limited by the price server: pausing requests for ${ago(fd.backoff_s)}. Showing the last data received.` }));
+    if (fd.quiet_s > 0) parts.push(el("div", { className: "warn", textContent:
+      "The price server asked for a long pause, so live shortlist updates are off for a day; only the hourly list is fetched. Use margin checks for current prices." }));
   }
   for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
   b.append(...parts);

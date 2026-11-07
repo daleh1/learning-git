@@ -171,10 +171,11 @@ class HardcoreFeed:
       we back off like the plugin does (Retry-After, else 30 s doubling to 5 min).
     - State (data, timers, backoff) is saved to disk so restarting the scanner doesn't refetch.
     """
-    LIST_EVERY = 20 * 60
-    LIVE_EVERY = 3 * 60
-    SWAP_EVERY = 60 * 60
-    MIN_GAP = 30
+    LIST_EVERY = 60 * 60   # the list is an ~hourly snapshot; fetching it more often gains nothing
+    LIVE_EVERY = 5 * 60
+    SWAP_EVERY = 3 * 60 * 60
+    MIN_GAP = 60
+    QUIET_FOR = 24 * 60 * 60  # after a long lockout, stop the shortlist polling for a day
     SHORTLIST = 10
 
     def __init__(self, ua: str = DEFAULT_UA, state_path: Path | None = None, base: str = HC_SERVER,
@@ -183,7 +184,8 @@ class HardcoreFeed:
         self.path = state_path or Path.home() / ".osrs_merch_state.json"
         self.lock = threading.Lock()
         self.st = {"list": None, "list_at": 0, "live": {}, "live_at": 0, "live_ids": [],
-                   "swap": None, "swap_at": 0, "last_request": 0, "backoff_until": 0, "failures": 0}
+                   "swap": None, "swap_at": 0, "last_request": 0, "backoff_until": 0, "failures": 0,
+                   "quiet_until": 0}
         try:
             self.st.update(json.loads(self.path.read_text()))
         except Exception:
@@ -215,6 +217,10 @@ class HardcoreFeed:
                 except (TypeError, ValueError):
                     pass
                 wait = max(min(30 * 2 ** min(self.st["failures"], 4), 300), min(retry, 3600))
+                if retry >= 600:
+                    # A long Retry-After is the operator telling us to back right off: from now on only
+                    # fetch the hourly list, no shortlist polling.
+                    self.st["quiet_until"] = now + self.QUIET_FOR
                 self.st["failures"] += 1
                 self.st["backoff_until"] = now + wait
             self._save()
@@ -234,7 +240,8 @@ class HardcoreFeed:
                 if not self.st["list"] or now - self.st["list_at"] >= self.LIST_EVERY:
                     self.st["list"] = self._get(f"/v1/items?{q}")
                     self.st["list_at"] = now
-                elif shortlist and (force_live or now - self.st["live_at"] >= self.LIVE_EVERY):
+                elif shortlist and now >= self.st.get("quiet_until", 0) and (
+                        force_live or now - self.st["live_at"] >= self.LIVE_EVERY):
                     ids = ",".join(str(i) for i in sorted(set(shortlist))[: self.SHORTLIST])
                     resp = self._get(f"/v1/items?ids={ids}&{q}")
                     self.st["live"] = {str(it["id"]): it for it in resp.get("items") or []}
@@ -274,6 +281,7 @@ class HardcoreFeed:
             "next_live_s": max(0, int(self.st["live_at"] + self.LIVE_EVERY - now)),
             "live_count": len(self.st["live"]),
             "backoff_s": int(max(0, self.st["backoff_until"] - now)),
+            "quiet_s": int(max(0, self.st.get("quiet_until", 0) - now)),
         }
 
 

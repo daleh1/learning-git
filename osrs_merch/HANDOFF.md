@@ -99,11 +99,14 @@ one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
 - `scan()` returns unprofitable items too (`keep_unprofitable=True`), so a check can bring them back.
   The UI and CLI filter on `margin > 0`.
 - The server rate-limits per IP (HTTP 429). All Hardcore requests go through `HardcoreFeed`.
-  It fetches the full list every 20 min (it is an ~hourly snapshot anyway), and refreshes the top
-  10 candidates (`pick_shortlist`) with ONE batched `/v1/items?ids=...` call every 3 min. It sends
-  the swap rate hourly, makes at most one request per `update()` and never two within 30 s, and backs
+  It fetches the full list every 60 min (it is an ~hourly snapshot anyway), and refreshes the top
+  10 candidates (`pick_shortlist`) with ONE batched `/v1/items?ids=...` call every 5 min. It sends
+  the swap rate hourly, makes at most one request per `update()` and never two within 60 s, and backs
   off on 429/503 the same way the plugin does. Its state is saved to `~/.osrs_merch_state.json`, so
-  restarts don't refetch. The Refresh button forces only the shortlist, and that is still throttled.
+  restarts don't refetch.
+  If the server sends Retry-After >= 10 min (it has sent 1800 s), the shortlist polling is switched off for 24 h.
+  The server is a community project built for plugin users, not a public API. Don't try to get around its limits
+  (no spoofed User-Agents, proxies or IP rotation). Ask the developer via the plugin's Discord instead. The Refresh button forces only the shortlist, and that is still throttled.
 
 ## Known issues / open questions (current work)
 1. **Trade ages look too old (diagnosed: server data ~58 min behind; user clock verified correct).** Every item's last trade seems to be at least about 40 minutes
