@@ -102,7 +102,7 @@
     <button data-game="osrs">Main game</button>
     <button data-game="dmm">Deadman</button>
   </div>
-  <div class="status"><span id="status">Loading…</span><button id="refresh">Refresh</button></div>
+  <div class="status"><span id="status">Loading…</span><button id="refresh" title="Ask for fresh shortlist prices now (still rate limited)">Refresh</button></div>
 </header>
 
 <div class="controls">
@@ -312,6 +312,8 @@ function render() {
         if (f.members) td.append(el("span", { className: "tag", textContent: "P2P" }));
         if (f.trusted_price) td.append(el("span", { className: "tag ok", textContent: "confirmed",
           title: "Median confirmed price: " + gp(f.trusted_price) }));
+        if (f.live) td.append(el("span", { className: "tag ok", textContent: "live",
+          title: "Refreshed with the frequently updated shortlist" }));
         td.append(checkButton(f));
       } else if (c.key === "book") {
         td.textContent = (f.best_bid || f.best_ask) ? gp(f.best_bid) + " / " + gp(f.best_ask) : "–";
@@ -371,7 +373,7 @@ function renderRecs(rows, budget) {
     const src = p.checked
       ? el("span", { className: "src-ok", textContent: `your check, ${age}m ago` })
       : el("span", { className: "src-old", textContent: data.server_time
-          ? `server data, ~${ago(p.age_s)} old`
+          ? `${p.live ? "live prices" : "hourly list"}, ~${ago(p.age_s)} old`
           : "server" });
     const tr = el("tr", {},
       el("td", { className: "rank", textContent: i + 1 }),
@@ -439,9 +441,20 @@ function renderBanner() {
   if (data.server_time) {
     const lag = data.fetched_at - data.server_time;
     if (lag > 120) parts.push(el("div", { className: "warn", textContent:
-      `Prices are delayed: the server's data is ${ago(lag)} old. Treat buy/sell prices as a guide and price-check in game.` }));
+      `The full item list is ${ago(lag)} old (items tagged "live" get fresher prices). Price-check in game before committing.` }));
     else if (lag < -120) parts.push(el("div", { className: "warn", textContent:
       `Your computer's clock looks ${ago(-lag)} behind the server's; trade ages may be off.` }));
+  }
+  const fd = data.feed;
+  if (fd) {
+    const t = s => s == null ? "never" : ago(s) + " ago";
+    parts.push(el("div", { className: "dim", textContent:
+      `Full item list: fetched ${t(fd.list_age_s)} (next in ${ago(fd.next_list_s)}) · ` +
+      `Live prices for the top ${fd.live_count || 10}: fetched ${t(fd.live_age_s)} (next in ${ago(fd.next_live_s)})` +
+      (fd.live_server_time ? `, server data ${ago(Math.max(0, data.fetched_at - fd.live_server_time))} old` : "") +
+      ". Requests are spaced out to stay under the server's rate limit." }));
+    if (fd.backoff_s > 0) parts.push(el("div", { className: "warn", textContent:
+      `Rate limited by the price server: pausing requests for ${ago(fd.backoff_s)}. Showing the last data received.` }));
   }
   for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
   b.append(...parts);

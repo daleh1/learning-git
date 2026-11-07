@@ -74,6 +74,7 @@ class Quote:
     trusted_price: int | None = None  # median of confirmed trades (Hardcore only)
     avg_sell: int | None = None   # 24h average price buyers paid (Hardcore only)
     avg_buy: int | None = None    # 24h average price sellers got (Hardcore only)
+    live: bool = False
 
 
 @dataclass
@@ -100,6 +101,7 @@ class Flip:
     asks: int
     trusted_price: int | None
     avg_margin: int | None = None  # margin using 24h averages: a steadier sanity check
+    live: bool = False             # prices from the frequently refreshed shortlist
 
 
 # ---------------------------------------------------------------- fetching
@@ -131,13 +133,8 @@ def wiki_quotes(game: str, ua: str) -> list[Quote]:
     return out
 
 
-def hardcore_raw(ua: str, base: str = HC_SERVER) -> dict:
-    q = urllib.parse.urlencode({"world": HC_ECONOMY, "include": "trust,fill"})
-    return fetch_json(f"{base}/v1/items?{q}", ua)
-
-
-def hardcore_quotes(ua: str, base: str = HC_SERVER, raw: dict | None = None) -> list[Quote]:
-    items = (raw if raw is not None else hardcore_raw(ua, base)).get("items") or []
+def hardcore_quotes(ua: str, raw: dict) -> list[Quote]:
+    items = raw.get("items") or []
     out = []
     for s in items:
         # Prefer live fills over imported GE-history rows (which have no real time).
@@ -155,16 +152,138 @@ def hardcore_quotes(ua: str, base: str = HC_SERVER, raw: dict | None = None) -> 
             best_ask=s.get("trustedBestAsk") or s.get("bestAsk"),
             bids=int(s.get("bids") or 0), asks=int(s.get("asks") or 0),
             trusted_price=s.get("trustedPrice"),
-            avg_sell=s.get("avgBuy24"), avg_buy=s.get("avgSell24"),
+            avg_sell=s.get("avgBuy24"), avg_buy=s.get("avgSell24"), live=bool(s.get("live")),
         ))
     return out
 
 
-def hardcore_swap_rate(ua: str, base: str = HC_SERVER):
-    try:
-        return fetch_json(f"{base}/v1/swap-rate?world={HC_ECONOMY}", ua)
-    except Exception:
-        return None
+class RateLimited(Exception):
+    pass
+
+
+class HardcoreFeed:
+    """Polite access to the Hardcore price server, which rate-limits per IP address.
+
+    - The full item list is only an (about hourly) snapshot, so it is fetched rarely (LIST_EVERY).
+    - The best few candidates (SHORTLIST) are refreshed in ONE batched /v1/items?ids=... request,
+      the same call the RuneLite plugin makes, every LIVE_EVERY seconds.
+    - At most one request per update() call, never two within MIN_GAP seconds, and after a 429/503
+      we back off like the plugin does (Retry-After, else 30 s doubling to 5 min).
+    - State (data, timers, backoff) is saved to disk so restarting the scanner doesn't refetch.
+    """
+    LIST_EVERY = 20 * 60
+    LIVE_EVERY = 3 * 60
+    SWAP_EVERY = 60 * 60
+    MIN_GAP = 30
+    SHORTLIST = 10
+
+    def __init__(self, ua: str = DEFAULT_UA, state_path: Path | None = None, base: str = HC_SERVER,
+                 clock=time.time):
+        self.ua, self.base, self.clock = ua, base, clock
+        self.path = state_path or Path.home() / ".osrs_merch_state.json"
+        self.lock = threading.Lock()
+        self.st = {"list": None, "list_at": 0, "live": {}, "live_at": 0, "live_ids": [],
+                   "swap": None, "swap_at": 0, "last_request": 0, "backoff_until": 0, "failures": 0}
+        try:
+            self.st.update(json.loads(self.path.read_text()))
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            self.path.write_text(json.dumps(self.st))
+        except Exception:
+            pass
+
+    def blocked_for(self) -> int:
+        now = self.clock()
+        return int(max(self.st["backoff_until"] - now, self.st["last_request"] + self.MIN_GAP - now, 0))
+
+    def _get(self, path: str) -> dict:
+        now = self.clock()
+        if now < self.st["backoff_until"]:
+            raise RateLimited(f"rate limited, retrying in {int(self.st['backoff_until'] - now)}s")
+        self.st["last_request"] = now
+        try:
+            data = fetch_json(f"{self.base}{path}", self.ua)
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code in (429, 503):
+                retry = 0
+                try:
+                    retry = int((getattr(e, "headers", None) or {}).get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    pass
+                wait = max(min(30 * 2 ** min(self.st["failures"], 4), 300), min(retry, 3600))
+                self.st["failures"] += 1
+                self.st["backoff_until"] = now + wait
+            self._save()
+            raise
+        self.st["failures"] = 0
+        self.st["backoff_until"] = 0
+        return data
+
+    def update(self, shortlist: list[int] | None = None, force_live: bool = False) -> str | None:
+        """Make at most one request, if one is due and allowed. Returns a warning, if any."""
+        with self.lock:
+            if self.blocked_for() > 0:
+                return None
+            now = self.clock()
+            q = f"world={HC_ECONOMY}&include=trust,fill"
+            try:
+                if not self.st["list"] or now - self.st["list_at"] >= self.LIST_EVERY:
+                    self.st["list"] = self._get(f"/v1/items?{q}")
+                    self.st["list_at"] = now
+                elif shortlist and (force_live or now - self.st["live_at"] >= self.LIVE_EVERY):
+                    ids = ",".join(str(i) for i in sorted(set(shortlist))[: self.SHORTLIST])
+                    resp = self._get(f"/v1/items?ids={ids}&{q}")
+                    self.st["live"] = {str(it["id"]): it for it in resp.get("items") or []}
+                    self.st["live_ids"] = sorted(set(shortlist))[: self.SHORTLIST]
+                    self.st["live_at"] = now
+                    self.st["live_time"] = resp.get("time")
+                elif now - self.st["swap_at"] >= self.SWAP_EVERY:
+                    self.st["swap_at"] = now
+                    self.st["swap"] = self._get(f"/v1/swap-rate?world={HC_ECONOMY}")
+            except RateLimited as e:
+                return str(e)
+            except Exception as e:
+                code = getattr(e, "code", None)
+                return (f"Price server said 429 Too Many Requests; pausing {self.blocked_for()}s."
+                        if code == 429 else f"Price server request failed: {e}")
+            finally:
+                self._save()
+            return None
+
+    def items(self) -> list[dict]:
+        """The full list with the fresher shortlist entries laid over it (each marked live=True)."""
+        merged = {str(it["id"]): it for it in (self.st["list"] or {}).get("items") or []}
+        if self.clock() - self.st["live_at"] < 3 * self.LIVE_EVERY:  # don't trust old "live" data
+            for k, it in self.st["live"].items():
+                merged[k] = dict(it, live=True)
+        return list(merged.values())
+
+    def status(self) -> dict:
+        now = self.clock()
+        lst = self.st["list"] or {}
+        return {
+            "list_age_s": int(now - self.st["list_at"]) if self.st["list_at"] else None,
+            "list_server_time": lst.get("time"),
+            "next_list_s": max(0, int(self.st["list_at"] + self.LIST_EVERY - now)),
+            "live_age_s": int(now - self.st["live_at"]) if self.st["live_at"] else None,
+            "live_server_time": self.st.get("live_time"),
+            "next_live_s": max(0, int(self.st["live_at"] + self.LIVE_EVERY - now)),
+            "live_count": len(self.st["live"]),
+            "backoff_s": int(max(0, self.st["backoff_until"] - now)),
+        }
+
+
+def pick_shortlist(flips: list["Flip"], n: int) -> list[int]:
+    """Best n candidates by a conservative profit estimate: the ones worth fresh prices."""
+    d = DEFAULTS["hardcore"]
+    good = [f for f in flips if f.margin > 0 and f.vol_24h >= d["min_volume"] and f.roi <= d["max_roi"]
+            and (f.avg_margin is None or f.avg_margin > 0)]
+    score = lambda f: (min(f.margin, f.avg_margin) if f.avg_margin is not None else f.margin) * f.max_units
+    return [f.item_id for f in sorted(good, key=score, reverse=True)[:n]]
 
 
 _mapping_cache: dict = {}
@@ -204,6 +323,7 @@ def build_flips(quotes: list[Quote], mapping: dict[int, dict], now: float,
             trusted_price=q.trusted_price,
             avg_margin=(q.avg_sell - ge_tax(q.avg_sell, name) - q.avg_buy)
             if q.avg_sell and q.avg_buy else None,
+            live=q.live,
         ))
     return flips
 
@@ -223,36 +343,49 @@ def filter_and_sort(flips, *, min_volume=0, max_age=10**9, max_roi=10.0, f2p=Fal
     return sorted(out, key=lambda f: getattr(f, sort), reverse=True)
 
 
-def scan(game: str, ua: str = DEFAULT_UA) -> dict:
-    """Fetch and analyse one economy. Returns a JSON-ready dict for the UI."""
+_feed: HardcoreFeed | None = None
+
+
+def get_feed(ua: str) -> HardcoreFeed:
+    global _feed
+    if _feed is None:
+        _feed = HardcoreFeed(ua)
+    return _feed
+
+
+def scan(game: str, ua: str = DEFAULT_UA, force: bool = False, feed: HardcoreFeed | None = None) -> dict:
+    """Fetch (politely) and analyse one economy. Returns a JSON-ready dict for the UI."""
     warnings = []
     try:
         mapping = wiki_mapping(ua)
     except Exception as e:
         mapping = {}
         warnings.append(f"Wiki item mapping unavailable ({e}); no buy limits/icons.")
-    server_time = None
+    now = time.time()
+    status, swap, server_time = None, None, None
     if game == "hardcore":
-        raw = hardcore_raw(ua)
-        server_time = raw.get("time")
-        if server_time and server_time > 1e11:  # milliseconds
-            server_time //= 1000
-        quotes = hardcore_quotes(ua, raw=raw)
+        feed = feed or get_feed(ua)
+        # Pick the shortlist from what we already have, then let the feed make at most one request.
+        current = build_flips(hardcore_quotes(ua, raw={"items": feed.items()}), mapping, now)
+        w = feed.update(pick_shortlist(current, feed.SHORTLIST), force_live=force)
+        if w:
+            warnings.append(w)
+        if not feed.st["list"]:
+            raise RuntimeError(w or "No Hardcore data yet; waiting for the rate limit to clear.")
+        quotes = hardcore_quotes(ua, raw={"items": feed.items()})
+        status, swap = feed.status(), feed.st.get("swap")
+        server_time = status["list_server_time"]
     else:
         quotes = wiki_quotes(game, ua)
-    now = time.time()
     # Keep unprofitable items too: a manual margin check in the UI can make them profitable.
     flips = build_flips(quotes, mapping, now, keep_unprofitable=True)
     newest = max((max(q.buy_time, q.sell_time) for q in quotes), default=None)
-    result = {"game": game, "fetched_at": int(now), "items_seen": len(quotes),
-              "server_time": server_time, "newest_trade_age_s": int(now - newest) if newest else None,
-              "flips": [asdict(f) for f in flips], "defaults": DEFAULTS[game],
-              "warnings": warnings, "swap_rate": None}
-    if game == "hardcore":
-        result["swap_rate"] = hardcore_swap_rate(ua)
-        if not quotes:
-            warnings.append("The Hardcore price server returned no items with both a buy and a sell price yet.")
-    return result
+    if game == "hardcore" and not quotes:
+        warnings.append("The Hardcore price server returned no items with both a buy and a sell price yet.")
+    return {"game": game, "fetched_at": int(now), "items_seen": len(quotes),
+            "server_time": server_time, "newest_trade_age_s": int(now - newest) if newest else None,
+            "flips": [asdict(f) for f in flips], "defaults": DEFAULTS[game],
+            "warnings": warnings, "swap_rate": swap, "feed": status}
 
 
 # ---------------------------------------------------------------- terminal output
@@ -290,61 +423,33 @@ def render(flips, top: int) -> str:
     return "\n".join(lines)
 
 
-def _newest(obj) -> int | None:
-    """Newest unix-seconds timestamp anywhere in a JSON value (keys ending in Time/ts/time)."""
-    best = None
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, (int, float)) and (k.endswith("Time") or k in ("ts", "time")) and 1e9 < v < 1e11:
-                best = max(best or 0, int(v))
-            elif isinstance(v, (dict, list)):
-                n = _newest(v)
-                if n:
-                    best = max(best or 0, n)
-    elif isinstance(obj, list):
-        for v in obj:
-            n = _newest(v)
-            if n:
-                best = max(best or 0, n)
-    return best
-
-
 def run_debug(args) -> int:
-    """Compare how fresh each Hardcore server endpoint is, for items matching a name."""
-    ua = args.user_agent
-    inc = f"world={HC_ECONOMY}&include=trust,fill"
-    raw, hdrs = fetch_json_headers(f"{HC_SERVER}/v1/items?{inc}", ua, fresh=True)
+    """Show the polite feed's state and the data it holds for items matching a name. Makes at most
+    one request, and only if the rate limiter allows it."""
+    feed = get_feed(args.user_agent)
+    w = feed.update(None)
     now = int(time.time())
-    print(f"Your computer's clock: {now} ({time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
-    print(f"Server HTTP Date header: {hdrs.get('Date')}  Cache-Control: {hdrs.get('Cache-Control')}  Age: {hdrs.get('Age')}")
-    st = raw.get("time")
-    print(f"Full list  /v1/items: 'time' {fmt_age(now - st) if st else '?'} ago, newest trade "
-          f"{fmt_age(now - _newest(raw.get('items')))} ago, {len(raw.get('items') or [])} items")
+    st = feed.status()
+    print(f"Your clock: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}   state file: {feed.path}")
+    if w:
+        print(f"! {w}")
+    print(f"Backoff: {st['backoff_s']}s remaining" if st["backoff_s"] else "Backoff: none (not rate limited)")
+    lt = st["list_server_time"]
+    print(f"Full list:  fetched {fmt_age(st['list_age_s']) + ' ago' if st['list_age_s'] is not None else 'never'}"
+          + (f", server snapshot {fmt_age(now - lt)} old" if lt else ""))
+    vt = st["live_server_time"]
+    print(f"Shortlist:  {st['live_count']} items, fetched "
+          f"{fmt_age(st['live_age_s']) + ' ago' if st['live_age_s'] is not None else 'never'}"
+          + (f", server snapshot {fmt_age(now - vt)} old" if vt else ""))
     want = args.debug.lower()
-    matches = [s for s in raw.get("items") or [] if want in (s.get("name") or "").lower()][:3]
-    for s in matches:
-        iid = s["id"]
-        print(f"\n=== {s.get('name')} (id {iid}) ===")
-        print(json.dumps(s, indent=2))
-        for label, url in [("Filtered   /v1/items?ids", f"{HC_SERVER}/v1/items?ids={iid}&{inc}"),
-                           ("Item view  /v1/item/{id}", f"{HC_SERVER}/v1/item/{iid}?limit=40&{inc}")]:
-            try:
-                time.sleep(5)  # the server rate-limits hard; space requests out
-                d, h = fetch_json_headers(url, ua, fresh=True)
-                n = _newest(d)
-                t = d.get("time") if isinstance(d, dict) else None
-                print(f"{label}: newest trade {fmt_age(now - n) if n else '?'} ago"
-                      + (f", 'time' {fmt_age(now - t)} ago" if isinstance(t, int) else "")
-                      + f"  (Cache-Control: {h.get('Cache-Control')}, Age: {h.get('Age')})")
-                trades = d.get("trades") or d.get("recent") or [] if isinstance(d, dict) else []
-                for tr in trades[:5]:
-                    if isinstance(tr, dict) and tr.get("ts"):
-                        print(f"    {tr.get('side', '?'):<4} {tr.get('qty', '?'):>6} @ {tr.get('price')}  {fmt_age(now - int(tr['ts']))} ago")
-            except Exception as e:
-                hint = " (rate limited: close the UI tab and wait a few minutes, then retry)" if "429" in str(e) else ""
-                print(f"{label}: failed ({e}){hint}")
-    print("\nIf the filtered/item endpoints are much fresher than the full list, the full list is cached"
-          " and the scanner should fetch candidates by id. If all are equally old, the server delays public data.")
+    for it in feed.items():
+        if want in (it.get("name") or "").lower():
+            print(("\n[LIVE] " if it.get("live") else "\n[LIST] ") + json.dumps(it, indent=2))
+            for k, v in it.items():
+                if k.endswith("Time") and v:
+                    print(f"  {k:<18} = {fmt_age(max(0, now - int(v)))} ago")
+    print("\nIf the shortlist snapshot is much fresher than the full list, live prices work; "
+          "if both are ~1h old, the server delays all public data.")
     return 0
 
 
@@ -388,13 +493,15 @@ class Cache:
     blocked_until = 0.0  # set when the server answers 429 Too Many Requests
 
     def get(self, game: str, force: bool = False) -> dict:
+        if game == "hardcore":
+            return scan(game, self.ua, force=force)
         with self.lock:
             hit = self.data.get(game)
             fresh_enough = hit and time.time() - hit[0] < CACHE_SECONDS
             if hit and (fresh_enough and not force or time.time() < self.blocked_until):
                 return hit[1]
         try:
-            result = scan(game, self.ua)
+            result = scan(game, self.ua, force=force)
         except Exception as e:
             if getattr(e, "code", None) == 429:
                 retry = getattr(e, "headers", {}).get("Retry-After") if getattr(e, "headers", None) else None

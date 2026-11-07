@@ -98,8 +98,12 @@ one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
   tax and margin are recomputed in JS (`effective()`). JS `tax()` mirrors Python `ge_tax()`, so keep them in sync.
 - `scan()` returns unprofitable items too (`keep_unprofitable=True`), so a check can bring them back.
   The UI and CLI filter on `margin > 0`.
-- The server rate-limits hard (HTTP 429). `Cache` backs off (Retry-After, or 180s) and keeps
-  serving the last good data with a warning. Never add per-item polling without heavy spacing.
+- The server rate-limits per IP (HTTP 429). All Hardcore requests go through `HardcoreFeed`.
+  It fetches the full list every 20 min (it is an ~hourly snapshot anyway), and refreshes the top
+  10 candidates (`pick_shortlist`) with ONE batched `/v1/items?ids=...` call every 3 min. It sends
+  the swap rate hourly, makes at most one request per `update()` and never two within 30 s, and backs
+  off on 429/503 the same way the plugin does. Its state is saved to `~/.osrs_merch_state.json`, so
+  restarts don't refetch. The Refresh button forces only the shortlist, and that is still throttled.
 
 ## Known issues / open questions (current work)
 1. **Trade ages look too old (diagnosed: server data ~58 min behind; user clock verified correct).** Every item's last trade seems to be at least about 40 minutes

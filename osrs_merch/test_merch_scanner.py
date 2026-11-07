@@ -1,5 +1,8 @@
 import json
+import tempfile
 import threading
+import urllib.error
+from pathlib import Path
 import unittest
 import urllib.request
 from unittest import mock
@@ -51,7 +54,7 @@ class Tests(unittest.TestCase):
 
     def test_hardcore_quotes_and_flips(self):
         with mock.patch.object(ms, "fetch_json", fake_fetch):
-            quotes = ms.hardcore_quotes("ua")
+            quotes = ms.hardcore_quotes("ua", HC_ITEMS)
             mapping = ms.wiki_mapping("ua")
         self.assertEqual([q.item_id for q in quotes], [1, 2])
         self.assertEqual((quotes[0].sell_ref, quotes[0].buy_ref), (300_000, 280_000))
@@ -68,10 +71,11 @@ class Tests(unittest.TestCase):
 
     def test_budget_caps_units(self):
         with mock.patch.object(ms, "fetch_json", fake_fetch):
-            flips = ms.build_flips(ms.hardcore_quotes("ua"), ms.wiki_mapping("ua"), NOW, budget=600_000)
+            flips = ms.build_flips(ms.hardcore_quotes("ua", HC_ITEMS), ms.wiki_mapping("ua"), NOW, budget=600_000)
         self.assertEqual({f.item_id: f.max_units for f in flips}, {1: 2, 2: 0})
 
     def test_ui_server_serves_page_and_api(self):
+        ms._feed = ms.HardcoreFeed("ua", Path(tempfile.mkdtemp()) / "state.json")
         with mock.patch.object(ms, "fetch_json", fake_fetch):
             srv = ms.ThreadingHTTPServer(("127.0.0.1", 0), ms.make_handler(ms.Cache("ua")))
             threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -80,10 +84,70 @@ class Tests(unittest.TestCase):
                 self.assertIn(b"GE <span>Merch</span>", urllib.request.urlopen(base + "/").read())
                 data = json.load(urllib.request.urlopen(base + "/api/flips?game=hardcore"))
                 self.assertEqual(len(data["flips"]), 2)
-                self.assertEqual(data["swap_rate"]["hardcore"], 1_000_000)
                 self.assertEqual(data["server_time"], NOW)
             finally:
                 srv.shutdown()
+
+
+class FeedTests(unittest.TestCase):
+    def setUp(self):
+        self.t = [NOW]
+        self.calls = []
+        self.state = Path(tempfile.mkdtemp()) / "state.json"
+        self.fail_with = None
+
+    def fetch(self, url, *a, **k):
+        self.calls.append(url)
+        if self.fail_with:
+            raise self.fail_with
+        if "ids=" in url:
+            return {"time": NOW, "items": [dict(HC_ITEMS["items"][0], lastFillBuy=310_000)]}
+        if "swap-rate" in url:
+            return {"main": 9_000_000, "hardcore": 1_000_000}
+        return HC_ITEMS
+
+    def feed(self):
+        return ms.HardcoreFeed("ua", self.state, clock=lambda: self.t[0])
+
+    def test_one_request_per_update_and_spacing(self):
+        f = self.feed()
+        with mock.patch.object(ms, "fetch_json", self.fetch):
+            f.update([1, 2])                  # first: the full list
+            f.update([1, 2])                  # too soon: nothing
+            self.t[0] += f.MIN_GAP
+            f.update([1, 2])                  # shortlist, batched in one request
+            self.t[0] += f.MIN_GAP
+            f.update([1, 2])                  # live not due yet -> swap rate
+            self.t[0] += f.MIN_GAP
+            f.update([1, 2])                  # nothing due
+        self.assertEqual(len(self.calls), 3)
+        self.assertIn("ids=1,2&", self.calls[1])
+        live = {it["id"]: it for it in f.items()}
+        self.assertTrue(live[1]["live"])
+        self.assertEqual(live[1]["lastFillBuy"], 310_000)
+        self.assertNotIn("live", live[2])
+
+    def test_429_backs_off_and_persists(self):
+        f = self.feed()
+        self.fail_with = urllib.error.HTTPError("u", 429, "Too Many", {"Retry-After": "120"}, None)
+        with mock.patch.object(ms, "fetch_json", self.fetch):
+            w = f.update([1])
+            self.assertIn("429", w)
+            self.t[0] += 100
+            self.fail_with = None
+            f2 = self.feed()                  # restart: the backoff is remembered
+            f2.update([1])
+            self.assertEqual(len(self.calls), 1)
+            self.t[0] += 30
+            f2.update([1])
+            self.assertEqual(len(self.calls), 2)
+
+    def test_shortlist_skips_negative_average(self):
+        with mock.patch.object(ms, "fetch_json", fake_fetch):
+            ms._mapping_cache.clear()
+            flips = ms.build_flips(ms.hardcore_quotes("ua", HC_ITEMS), ms.wiki_mapping("ua"), NOW)
+        flips[1].avg_margin = -5
+        self.assertEqual(ms.pick_shortlist(flips, 5), [flips[0].item_id])
 
 
 if __name__ == "__main__":
