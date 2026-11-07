@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GE Merch Scanner</title>
+<style>
+  :root {
+    --bg: #f6f4ef; --panel: #ffffff; --text: #1d1b16; --muted: #6b665c; --line: #e4dfd4;
+    --accent: #b8860b; --good: #1f7a3a; --bad: #b3261e; --chip: #efe9dc; --hover: #faf7f0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14130f; --panel: #1d1b16; --text: #ece7db; --muted: #9c968a; --line: #2e2b24;
+            --accent: #e0b04a; --good: #5cc27a; --bad: #ef7d74; --chip: #2a2720; --hover: #24221c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 16px 20px 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  h1 span { color: var(--accent); }
+  .seg { display: inline-flex; background: var(--chip); border-radius: 8px; padding: 3px; }
+  .seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 12px; border-radius: 6px;
+                font: inherit; cursor: pointer; }
+  .seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  .status { margin-left: auto; color: var(--muted); font-size: 13px; display: flex; gap: 10px; align-items: center; }
+  .status button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+                   border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  .controls { padding: 4px 20px 12px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; }
+  .controls label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 3px; }
+  .controls input[type=text], .controls input[type=number] {
+    font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--text); width: 110px; }
+  .controls input#q { width: 180px; }
+  .controls .check { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 7px; color: var(--text); font-size: 13px; }
+  .banner { margin: 0 20px 10px; padding: 8px 12px; border-radius: 8px; background: var(--chip); color: var(--muted); font-size: 13px; }
+  .banner b { color: var(--text); }
+  .warn { color: var(--bad); }
+  .wrap { margin: 0 20px 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; background: var(--panel); font-size: 12px; color: var(--muted); font-weight: 600;
+       cursor: pointer; user-select: none; }
+  th.sorted { color: var(--accent); }
+  th.sorted::after { content: " ▾"; }
+  th.sorted.asc::after { content: " ▴"; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:hover { background: var(--hover); }
+  td.item { display: flex; align-items: center; gap: 8px; min-width: 220px; }
+  td.item img { width: 24px; height: 24px; object-fit: contain; }
+  td.item a { color: var(--text); text-decoration: none; }
+  td.item a:hover { text-decoration: underline; }
+  .m { color: var(--good); font-weight: 600; }
+  .pot { font-weight: 700; }
+  .dim { color: var(--muted); }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--chip); color: var(--muted); }
+  .tag.ok { color: var(--good); }
+  .bar { position: relative; }
+  .bar i { position: absolute; left: 0; top: 50%; height: 18px; transform: translateY(-50%); background: var(--accent);
+           opacity: .14; border-radius: 3px; }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .hc-only { }
+  body:not(.hc) .hc-only { display: none; }
+  footer { margin: 0 20px 24px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GE <span>Merch</span> Scanner</h1>
+  <div class="seg" id="games">
+    <button data-game="hardcore">Hardcore Worlds</button>
+    <button data-game="osrs">Main game</button>
+    <button data-game="dmm">Deadman</button>
+  </div>
+  <div class="status"><span id="status">Loading…</span><button id="refresh">Refresh</button></div>
+</header>
+
+<div class="controls">
+  <label>Search<input id="q" type="text" placeholder="item name"></label>
+  <label>Budget (e.g. 20m)<input id="budget" type="text" placeholder="unlimited"></label>
+  <label>Min 24h volume<input id="minvol" type="number" min="0"></label>
+  <label>Max trade age (min)<input id="maxage" type="number" min="1"></label>
+  <label>Min price<input id="minprice" type="text" placeholder="0"></label>
+  <label>Max ROI %<input id="maxroi" type="number" min="1"></label>
+  <label class="check"><input id="f2p" type="checkbox"> F2P only</label>
+  <label class="check"><input id="auto" type="checkbox" checked> Auto-refresh (60s)</label>
+</div>
+
+<div class="banner" id="banner"></div>
+
+<div class="wrap">
+  <table>
+    <thead><tr id="head"></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>No items match these filters.</div>
+</div>
+
+<footer>
+  Buy at = recent price sellers received (place your buy here or slightly above). Sell at = recent price buyers paid.
+  Margin is after 2% GE tax. 4h profit = margin × units you can realistically move in one buy-limit window
+  (capped by buy limit, ~25% of the thinner side's flow, and your budget). Always price-check with a quick buy/sell before
+  committing a full limit. <span class="hc-only">Hardcore prices come from players running the Hardcore World Tool Kit
+  RuneLite plugin, so coverage is partial; "confirmed" means trades from established players at a normal price.</span>
+</footer>
+
+<script>
+const COLS = [
+  { key: "name",      label: "Item" },
+  { key: "buy",       label: "Buy at",    gp: true },
+  { key: "sell",      label: "Sell at",   gp: true },
+  { key: "tax",       label: "Tax",       gp: true, dim: true },
+  { key: "margin",    label: "Margin",    gp: true, cls: "m" },
+  { key: "roi",       label: "ROI",       fmt: v => (v * 100).toFixed(1) + "%" },
+  { key: "limit",     label: "Limit",     fmt: v => v == null ? "–" : v.toLocaleString(), dim: true },
+  { key: "vol_24h",   label: "Vol 24h",   gp: true },
+  { key: "book",      label: "Book bid / ask", hc: true, sortable: false },
+  { key: "units",     label: "Units / 4h", fmt: v => v.toLocaleString() },
+  { key: "potential", label: "4h profit", gp: true, cls: "pot", bar: true },
+  { key: "age_s",     label: "Last trade", fmt: ago, asc: true },
+];
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+let game = params.get("game") || "hardcore";
+let sortKey = "potential", sortAsc = false, data = null, nextRefresh = 0, inflight = false;
+
+function gp(n) {
+  if (n == null) return "–";
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + "b";
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + "m";
+  if (a >= 1e4) return (n / 1e3).toFixed(1) + "k";
+  return n.toLocaleString();
+}
+function ago(s) { return s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m"; }
+function parseGp(t) {
+  t = (t || "").trim().toLowerCase().replace(/,/g, "");
+  if (!t) return 0;
+  const m = { k: 1e3, m: 1e6, b: 1e9 }[t.slice(-1)];
+  const v = parseFloat(m ? t.slice(0, -1) : t);
+  return isNaN(v) ? 0 : Math.floor(v * (m || 1));
+}
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  for (const k of kids) e.append(k);
+  return e;
+}
+
+// Remember filters per economy.
+function saveFilters() {
+  const f = {}; for (const id of ["q","budget","minvol","maxage","minprice","maxroi"]) f[id] = $(id).value;
+  f.f2p = $("f2p").checked;
+  try { localStorage.setItem("merch:" + game, JSON.stringify(f)); } catch (e) {}
+}
+function loadFilters(defaults) {
+  let f = null; try { f = JSON.parse(localStorage.getItem("merch:" + game)); } catch (e) {}
+  $("q").value = f?.q ?? ""; $("budget").value = f?.budget ?? ""; $("minprice").value = f?.minprice ?? "";
+  $("minvol").value = f?.minvol ?? defaults.min_volume;
+  $("maxage").value = f?.maxage ?? Math.round(defaults.max_age / 60);
+  $("maxroi").value = f?.maxroi ?? Math.round(defaults.max_roi * 100);
+  $("f2p").checked = !!f?.f2p;
+}
+
+function buildHead() {
+  const tr = $("head"); tr.replaceChildren();
+  for (const c of COLS) {
+    if (c.hc && game !== "hardcore") continue;
+    const th = el("th", { textContent: c.label });
+    if (c.key === sortKey) { th.classList.add("sorted"); if (sortAsc) th.classList.add("asc"); }
+    if (c.sortable !== false) th.onclick = () => {
+      if (sortKey === c.key) sortAsc = !sortAsc; else { sortKey = c.key; sortAsc = !!c.asc || c.key === "name"; }
+      buildHead(); render();
+    };
+    tr.append(th);
+  }
+}
+
+function render() {
+  if (!data) return;
+  const q = $("q").value.trim().toLowerCase();
+  const budget = parseGp($("budget").value);
+  const minvol = +$("minvol").value || 0;
+  const maxage = (+$("maxage").value || 1e9) * 60;
+  const minprice = parseGp($("minprice").value);
+  const maxroi = (+$("maxroi").value || 1e9) / 100;
+  const f2p = $("f2p").checked;
+
+  let rows = data.flips.filter(f =>
+    f.vol_24h >= minvol && f.age_s <= maxage && f.roi <= maxroi && f.buy >= minprice &&
+    (!f2p || !f.members) && (!q || f.name.toLowerCase().includes(q)));
+  for (const f of rows) {
+    f.units = budget ? Math.min(f.max_units, Math.floor(budget / f.buy)) : f.max_units;
+    f.potential = f.margin * f.units;
+  }
+  rows.sort((a, b) => {
+    const x = a[sortKey], y = b[sortKey];
+    const r = typeof x === "string" ? x.localeCompare(y) : (x ?? -Infinity) - (y ?? -Infinity);
+    return sortAsc ? r : -r;
+  });
+  rows = rows.slice(0, 300);
+  const maxPot = Math.max(1, ...rows.map(r => r.potential));
+
+  const body = $("rows"); body.replaceChildren();
+  for (const f of rows) {
+    const tr = el("tr");
+    for (const c of COLS) {
+      if (c.hc && game !== "hardcore") continue;
+      const td = el("td");
+      if (c.key === "name") {
+        td.className = "item";
+        if (f.icon) td.append(el("img", { src: "https://oldschool.runescape.wiki/images/" +
+          encodeURIComponent(f.icon.replace(/ /g, "_")), alt: "", loading: "lazy" }));
+        td.append(el("a", { textContent: f.name, target: "_blank", rel: "noopener",
+          href: "https://oldschool.runescape.wiki/w/Special:Lookup?type=item&id=" + f.item_id }));
+        if (f.members) td.append(el("span", { className: "tag", textContent: "P2P" }));
+        if (f.trusted_price) td.append(el("span", { className: "tag ok", textContent: "confirmed",
+          title: "Median confirmed price: " + gp(f.trusted_price) }));
+      } else if (c.key === "book") {
+        td.textContent = (f.best_bid || f.best_ask) ? gp(f.best_bid) + " / " + gp(f.best_ask) : "–";
+        td.title = f.bids + " open buy offers, " + f.asks + " open sell offers";
+        td.className = "dim";
+      } else {
+        const v = f[c.key];
+        td.textContent = c.gp ? gp(v) : c.fmt ? c.fmt(v) : v;
+        if (c.cls) td.classList.add(c.cls);
+        if (c.dim) td.classList.add("dim");
+        if (c.bar) { td.classList.add("bar"); td.prepend(el("i", { style: `width:${100 * f.potential / maxPot}%` })); }
+      }
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+  $("empty").hidden = rows.length > 0;
+}
+
+function renderBanner() {
+  const b = $("banner"); b.replaceChildren();
+  if (!data) return;
+  const parts = [el("span", {}, el("b", { textContent: data.flips.length.toLocaleString() }),
+    ` profitable spreads among ${data.items_seen.toLocaleString()} items with recent prices.`)];
+  const sr = data.swap_rate;
+  if (sr && sr.main && sr.hardcore) parts.push(el("span", {}, " Bond: ", el("b", { textContent: gp(sr.hardcore) }),
+    " here vs ", el("b", { textContent: gp(sr.main) }), ` on main game (1 Hardcore gp ≈ ${(sr.main / sr.hardcore).toFixed(1)} main gp).`));
+  for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
+  b.append(...parts);
+}
+
+async function load(force = false) {
+  if (inflight) return;
+  inflight = true;
+  $("status").textContent = "Updating…";
+  try {
+    const r = await fetch(`/api/flips?game=${game}${force ? "&force=1" : ""}`);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    const first = !data || data.game !== game;
+    data = j;
+    if (first) loadFilters(j.defaults);
+    renderBanner(); render();
+    $("status").textContent = "Updated " + new Date(j.fetched_at * 1000).toLocaleTimeString();
+  } catch (e) {
+    $("status").textContent = "Update failed: " + e.message;
+    if (!data || data.game !== game) { $("banner").textContent = "Couldn't load prices: " + e.message; $("rows").replaceChildren(); }
+  } finally {
+    inflight = false;
+    nextRefresh = Date.now() + 60000;
+  }
+}
+
+function setGame(g) {
+  game = g; data = null;
+  history.replaceState(null, "", "?game=" + g);
+  document.body.classList.toggle("hc", g === "hardcore");
+  for (const b of document.querySelectorAll("#games button")) b.classList.toggle("on", b.dataset.game === g);
+  buildHead(); load();
+}
+
+for (const b of document.querySelectorAll("#games button")) b.onclick = () => setGame(b.dataset.game);
+for (const id of ["q","budget","minvol","maxage","minprice","maxroi","f2p"])
+  $(id).addEventListener("input", () => { saveFilters(); render(); });
+$("refresh").onclick = () => load(true);
+setInterval(() => { if ($("auto").checked && Date.now() >= nextRefresh && !document.hidden) load(); }, 5000);
+setGame(game);
+</script>
+</body>
+</html>
