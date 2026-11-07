@@ -98,7 +98,7 @@
 
 <footer>
   Buy at = recent price sellers received (place your buy here or slightly above). Sell at = recent price buyers paid.
-  Buy seen / Sell seen = how long ago those two prices last traded. Margin is after 2% GE tax. 4h profit = margin × units you can realistically move in one buy-limit window
+  Buy seen / Sell seen = how long ago those two prices last traded. Margin is after 2% GE tax; "24h avg margin" uses the day's average prices and is steadier (if it is near zero, the current spread is probably a blip). 4h profit = margin × units you can realistically move in one buy-limit window
   (capped by buy limit, ~25% of the thinner side's flow, and your budget). Always price-check with a quick buy/sell before
   committing a full limit. <span class="hc-only">Hardcore prices come from players running the Hardcore World Tool Kit
   RuneLite plugin, so coverage is partial; "confirmed" means trades from established players at a normal price.</span>
@@ -111,6 +111,7 @@ const COLS = [
   { key: "sell",      label: "Sell at",   gp: true },
   { key: "tax",       label: "Tax",       gp: true, dim: true },
   { key: "margin",    label: "Margin",    gp: true, cls: "m" },
+  { key: "avg_margin", label: "24h avg margin", gp: true, hc: true },
   { key: "roi",       label: "ROI",       fmt: v => (v * 100).toFixed(1) + "%" },
   { key: "limit",     label: "Limit",     fmt: v => v == null ? "–" : v.toLocaleString(), dim: true },
   { key: "vol_24h",   label: "Vol 24h",   gp: true },
@@ -253,9 +254,10 @@ function renderBanner() {
     ` Newest trade in the data: ${ago(data.newest_trade_age_s)} ago.`));
   if (data.server_time) {
     const lag = data.fetched_at - data.server_time;
-    if (Math.abs(lag) > 120) parts.push(el("div", { className: "warn", textContent:
-      `Server snapshot time differs from your computer's clock by ${ago(Math.abs(lag))}` +
-      (lag > 0 ? " (server data is behind, or your clock is ahead)." : " (your clock is behind).") }));
+    if (lag > 120) parts.push(el("div", { className: "warn", textContent:
+      `Prices are delayed: the server's data is ${ago(lag)} old. Treat buy/sell prices as a guide and price-check in game.` }));
+    else if (lag < -120) parts.push(el("div", { className: "warn", textContent:
+      `Your computer's clock looks ${ago(-lag)} behind the server's; trade ages may be off.` }));
   }
   for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
   b.append(...parts);

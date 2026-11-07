@@ -88,7 +88,7 @@ one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
   stale offer), a "confirmed" tag when `trusted_price` exists, and the bond swap rate in the banner.
 
 ## Known issues / open questions (current work)
-1. **Trade ages look too old.** Every item's last trade seems to be at least about 40 minutes
+1. **Trade ages look too old (diagnosed: server data ~58 min behind; user clock verified correct).** Every item's last trade seems to be at least about 40 minutes
    old, even for busy items. Possible causes:
    - (a) few plugin users;
    - (b) the server publishes with a delay or caches its answers;

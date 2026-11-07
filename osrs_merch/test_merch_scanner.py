@@ -18,7 +18,7 @@ HC_ITEMS = {"time": NOW, "items": [
      "lastFillBuy": 300_000, "lastFillBuyTime": NOW - 60, "lastFillSell": 280_000, "lastFillSellTime": NOW - 120,
      "bestBid": 279_000, "bestAsk": 301_000, "bids": 3, "asks": 2, "vol24": 1200, "trustedPrice": 290_000},
     {"id": 2, "name": "Old school bond", "lastBuy": 1_050_000, "lastBuyTime": NOW - 30,
-     "lastSell": 1_000_000, "lastSellTime": NOW - 30, "vol24": 480},
+     "lastSell": 1_000_000, "lastSellTime": NOW - 30, "vol24": 480, "avgBuy24": 1_040_000, "avgSell24": 1_010_000},
     {"id": 3, "name": "Feather", "lastBuy": 5, "lastBuyTime": NOW - 5, "vol24": 9999},  # no sell side -> skipped
 ]}
 
@@ -63,6 +63,8 @@ class Tests(unittest.TestCase):
         self.assertEqual((whip.buy_age_s, whip.sell_age_s), (120, 60))
         self.assertEqual(flips[2].margin, 50_000)     # bonds are tax exempt
         self.assertEqual(flips[2].max_units, 10)
+        self.assertEqual(flips[2].avg_margin, 30_000)
+        self.assertIsNone(whip.avg_margin)
 
     def test_budget_caps_units(self):
         with mock.patch.object(ms, "fetch_json", fake_fetch):

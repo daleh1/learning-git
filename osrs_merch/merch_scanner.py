@@ -72,6 +72,8 @@ class Quote:
     bids: int = 0
     asks: int = 0
     trusted_price: int | None = None  # median of confirmed trades (Hardcore only)
+    avg_sell: int | None = None   # 24h average price buyers paid (Hardcore only)
+    avg_buy: int | None = None    # 24h average price sellers got (Hardcore only)
 
 
 @dataclass
@@ -97,14 +99,22 @@ class Flip:
     bids: int
     asks: int
     trusted_price: int | None
+    avg_margin: int | None = None  # margin using 24h averages: a steadier sanity check
 
 
 # ---------------------------------------------------------------- fetching
 
 def fetch_json(url: str, user_agent: str = DEFAULT_UA, timeout: float = 20.0):
-    req = urllib.request.Request(url, headers={"User-Agent": user_agent, "Accept": "application/json"})
+    return fetch_json_headers(url, user_agent, timeout)[0]
+
+
+def fetch_json_headers(url: str, user_agent: str = DEFAULT_UA, timeout: float = 20.0, fresh: bool = False):
+    headers = {"User-Agent": user_agent, "Accept": "application/json"}
+    if fresh:
+        headers["Cache-Control"] = "no-cache"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
+        return json.load(resp), dict(resp.headers)
 
 
 def wiki_quotes(game: str, ua: str) -> list[Quote]:
@@ -145,6 +155,7 @@ def hardcore_quotes(ua: str, base: str = HC_SERVER, raw: dict | None = None) -> 
             best_ask=s.get("trustedBestAsk") or s.get("bestAsk"),
             bids=int(s.get("bids") or 0), asks=int(s.get("asks") or 0),
             trusted_price=s.get("trustedPrice"),
+            avg_sell=s.get("avgBuy24"), avg_buy=s.get("avgSell24"),
         ))
     return out
 
@@ -191,6 +202,8 @@ def build_flips(quotes: list[Quote], mapping: dict[int, dict], now: float,
             members=bool(m.get("members")), icon=m.get("icon"),
             best_bid=q.best_bid, best_ask=q.best_ask, bids=q.bids, asks=q.asks,
             trusted_price=q.trusted_price,
+            avg_margin=(q.avg_sell - ge_tax(q.avg_sell, name) - q.avg_buy)
+            if q.avg_sell and q.avg_buy else None,
         ))
     return flips
 
@@ -276,24 +289,59 @@ def render(flips, top: int) -> str:
     return "\n".join(lines)
 
 
+def _newest(obj) -> int | None:
+    """Newest unix-seconds timestamp anywhere in a JSON value (keys ending in Time/ts/time)."""
+    best = None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (int, float)) and (k.endswith("Time") or k in ("ts", "time")) and 1e9 < v < 1e11:
+                best = max(best or 0, int(v))
+            elif isinstance(v, (dict, list)):
+                n = _newest(v)
+                if n:
+                    best = max(best or 0, n)
+    elif isinstance(obj, list):
+        for v in obj:
+            n = _newest(v)
+            if n:
+                best = max(best or 0, n)
+    return best
+
+
 def run_debug(args) -> int:
-    """Print the raw Hardcore server data for items matching a name, with local-clock ages."""
-    raw = hardcore_raw(args.user_agent)
+    """Compare how fresh each Hardcore server endpoint is, for items matching a name."""
+    ua = args.user_agent
+    inc = f"world={HC_ECONOMY}&include=trust,fill"
+    raw, hdrs = fetch_json_headers(f"{HC_SERVER}/v1/items?{inc}", ua, fresh=True)
     now = int(time.time())
     print(f"Your computer's clock: {now} ({time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    print(f"Server HTTP Date header: {hdrs.get('Date')}  Cache-Control: {hdrs.get('Cache-Control')}  Age: {hdrs.get('Age')}")
     st = raw.get("time")
-    print(f"Server 'time' field:   {st}" + (f"  (differs from your clock by {now - st}s)" if isinstance(st, int) and st < 1e11 else ""))
-    items = raw.get("items") or []
-    times = [v for s in items for k, v in s.items() if k.endswith("Time") and isinstance(v, (int, float))]
-    if times:
-        print(f"Items: {len(items)}. Newest timestamp in the whole response: {int(now - max(times))}s ago")
+    print(f"Full list  /v1/items: 'time' {fmt_age(now - st) if st else '?'} ago, newest trade "
+          f"{fmt_age(now - _newest(raw.get('items')))} ago, {len(raw.get('items') or [])} items")
     want = args.debug.lower()
-    for s in items:
-        if want in (s.get("name") or "").lower():
-            print("\n" + json.dumps(s, indent=2))
-            for k, v in s.items():
-                if k.endswith("Time") and v:
-                    print(f"  {k:<18} = {fmt_age(max(0, now - int(v)))} ago")
+    matches = [s for s in raw.get("items") or [] if want in (s.get("name") or "").lower()][:3]
+    for s in matches:
+        iid = s["id"]
+        print(f"\n=== {s.get('name')} (id {iid}) ===")
+        print(json.dumps(s, indent=2))
+        for label, url in [("Filtered   /v1/items?ids", f"{HC_SERVER}/v1/items?ids={iid}&{inc}"),
+                           ("Item view  /v1/item/{id}", f"{HC_SERVER}/v1/item/{iid}?limit=40&{inc}")]:
+            try:
+                d, h = fetch_json_headers(url, ua, fresh=True)
+                n = _newest(d)
+                t = d.get("time") if isinstance(d, dict) else None
+                print(f"{label}: newest trade {fmt_age(now - n) if n else '?'} ago"
+                      + (f", 'time' {fmt_age(now - t)} ago" if isinstance(t, int) else "")
+                      + f"  (Cache-Control: {h.get('Cache-Control')}, Age: {h.get('Age')})")
+                trades = d.get("trades") or d.get("recent") or [] if isinstance(d, dict) else []
+                for tr in trades[:5]:
+                    if isinstance(tr, dict) and tr.get("ts"):
+                        print(f"    {tr.get('side', '?'):<4} {tr.get('qty', '?'):>6} @ {tr.get('price')}  {fmt_age(now - int(tr['ts']))} ago")
+            except Exception as e:
+                print(f"{label}: failed ({e})")
+    print("\nIf the filtered/item endpoints are much fresher than the full list, the full list is cached"
+          " and the scanner should fetch candidates by id. If all are equally old, the server delays public data.")
     return 0
 
 
