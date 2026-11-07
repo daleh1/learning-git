@@ -87,6 +87,20 @@ one request a minute, cached in `Cache`, with `CACHE_SECONDS = 60`.
 - Hardcore-only extras: the "Book bid / ask" column (turns red when bid >= ask, which means a
   stale offer), a "confirmed" tag when `trusted_price` exists, and the bond swap rate in the banner.
 
+## Recommendations and margin checks (UI)
+- The "Recommended trades" panel fills up to N GE slots (default 8) within the budget. It ranks
+  items by `conf_margin * units`, where `conf_margin = min(margin, avg_margin)` unless the item
+  was margin-checked. Items whose 24h average margin is <= 0 are skipped.
+- A margin check means the user buys 1 instantly and sells 1 instantly in game, then enters both
+  prices with the "Check" button. These are saved in localStorage
+  (`merch:checks:<game>` holding `{itemId: {bought, sold, at}}`). For checks younger than
+  "valid for" minutes, `bought` replaces the sell price and `sold` replaces the buy price, and
+  tax and margin are recomputed in JS (`effective()`). JS `tax()` mirrors Python `ge_tax()`, so keep them in sync.
+- `scan()` returns unprofitable items too (`keep_unprofitable=True`), so a check can bring them back.
+  The UI and CLI filter on `margin > 0`.
+- The server rate-limits hard (HTTP 429). `Cache` backs off (Retry-After, or 180s) and keeps
+  serving the last good data with a warning. Never add per-item polling without heavy spacing.
+
 ## Known issues / open questions (current work)
 1. **Trade ages look too old (diagnosed: server data ~58 min behind; user clock verified correct).** Every item's last trade seems to be at least about 40 minutes
    old, even for busy items. Possible causes:

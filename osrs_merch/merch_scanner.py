@@ -179,14 +179,14 @@ def wiki_mapping(ua: str) -> dict[int, dict]:
 # ---------------------------------------------------------------- analysis
 
 def build_flips(quotes: list[Quote], mapping: dict[int, dict], now: float,
-                budget: int | None = None) -> list[Flip]:
+                budget: int | None = None, keep_unprofitable: bool = False) -> list[Flip]:
     flips = []
     for q in quotes:
         m = mapping.get(q.item_id, {})
         name = m.get("name") or q.name or str(q.item_id)
         tax = ge_tax(q.sell_ref, name)
         margin = q.sell_ref - tax - q.buy_ref
-        if margin <= 0 or q.buy_ref <= 0:
+        if q.buy_ref <= 0 or (margin <= 0 and not keep_unprofitable):
             continue
         limit = m.get("limit")
         flow = int(q.side_vol_24h / 6 * CAPTURE)  # 24h -> one 4h window, your share
@@ -218,7 +218,7 @@ DEFAULTS = {  # per-economy filter defaults: Hardcore data is much thinner
 def filter_and_sort(flips, *, min_volume=0, max_age=10**9, max_roi=10.0, f2p=False,
                     min_price=0, sort="potential"):
     out = [f for f in flips
-           if f.vol_24h >= min_volume and f.age_s <= max_age and f.roi <= max_roi
+           if f.margin > 0 and f.vol_24h >= min_volume and f.age_s <= max_age and f.roi <= max_roi
            and f.buy >= min_price and (not f2p or not f.members)]
     return sorted(out, key=lambda f: getattr(f, sort), reverse=True)
 
@@ -241,7 +241,8 @@ def scan(game: str, ua: str = DEFAULT_UA) -> dict:
     else:
         quotes = wiki_quotes(game, ua)
     now = time.time()
-    flips = build_flips(quotes, mapping, now)
+    # Keep unprofitable items too: a manual margin check in the UI can make them profitable.
+    flips = build_flips(quotes, mapping, now, keep_unprofitable=True)
     newest = max((max(q.buy_time, q.sell_time) for q in quotes), default=None)
     result = {"game": game, "fetched_at": int(now), "items_seen": len(quotes),
               "server_time": server_time, "newest_trade_age_s": int(now - newest) if newest else None,
@@ -328,6 +329,7 @@ def run_debug(args) -> int:
         for label, url in [("Filtered   /v1/items?ids", f"{HC_SERVER}/v1/items?ids={iid}&{inc}"),
                            ("Item view  /v1/item/{id}", f"{HC_SERVER}/v1/item/{iid}?limit=40&{inc}")]:
             try:
+                time.sleep(5)  # the server rate-limits hard; space requests out
                 d, h = fetch_json_headers(url, ua, fresh=True)
                 n = _newest(d)
                 t = d.get("time") if isinstance(d, dict) else None
@@ -339,7 +341,8 @@ def run_debug(args) -> int:
                     if isinstance(tr, dict) and tr.get("ts"):
                         print(f"    {tr.get('side', '?'):<4} {tr.get('qty', '?'):>6} @ {tr.get('price')}  {fmt_age(now - int(tr['ts']))} ago")
             except Exception as e:
-                print(f"{label}: failed ({e})")
+                hint = " (rate limited: close the UI tab and wait a few minutes, then retry)" if "429" in str(e) else ""
+                print(f"{label}: failed ({e}){hint}")
     print("\nIf the filtered/item endpoints are much fresher than the full list, the full list is cached"
           " and the scanner should fetch candidates by id. If all are equally old, the server delays public data.")
     return 0
@@ -382,12 +385,27 @@ class Cache:
     def __init__(self, ua: str):
         self.ua, self.lock, self.data = ua, threading.Lock(), {}
 
+    blocked_until = 0.0  # set when the server answers 429 Too Many Requests
+
     def get(self, game: str, force: bool = False) -> dict:
         with self.lock:
             hit = self.data.get(game)
-            if hit and not force and time.time() - hit[0] < CACHE_SECONDS:
+            fresh_enough = hit and time.time() - hit[0] < CACHE_SECONDS
+            if hit and (fresh_enough and not force or time.time() < self.blocked_until):
                 return hit[1]
-        result = scan(game, self.ua)
+        try:
+            result = scan(game, self.ua)
+        except Exception as e:
+            if getattr(e, "code", None) == 429:
+                retry = getattr(e, "headers", {}).get("Retry-After") if getattr(e, "headers", None) else None
+                self.blocked_until = time.time() + (int(retry) if str(retry or "").isdigit() else 180)
+            if not hit:
+                raise
+            # Keep showing the last good data rather than an error.
+            stale = dict(hit[1])
+            stale["warnings"] = list(stale.get("warnings", [])) + [
+                f"Couldn't refresh ({e}); showing data fetched at {time.strftime('%H:%M', time.localtime(hit[0]))}."]
+            return stale
         with self.lock:
             self.data[game] = (time.time(), result)
         return result

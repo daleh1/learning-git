@@ -62,6 +62,36 @@
   .hc-only { }
   body:not(.hc) .hc-only { display: none; }
   footer { margin: 0 20px 24px; color: var(--muted); font-size: 12px; }
+  h2 { font-size: 15px; margin: 0; }
+  .recs { margin: 0 20px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .recs-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 8px; }
+  .recs-head label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .recs-head input { width: 56px; font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+                     background: var(--panel); color: var(--text); }
+  .recs table td, .recs table th { border-bottom: 1px solid var(--line); }
+  .recs .total { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .recs .total b { color: var(--text); }
+  .rank { color: var(--accent); font-weight: 700; }
+  .recs td:nth-child(2), .recs th:nth-child(2) { text-align: left; width: 30%; }
+  .src-ok { color: var(--good); }
+  .src-old { color: var(--muted); }
+  button.chk { font: inherit; font-size: 12px; border: 1px solid var(--line); background: var(--chip); color: var(--text);
+               border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+  button.chk.done { color: var(--good); }
+  td.neg { color: var(--bad); font-weight: 600; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+           padding: 18px 20px; max-width: 420px; width: calc(100% - 32px); }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog h3 { margin: 0 0 6px; font-size: 16px; }
+  dialog p { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+  dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; margin-bottom: 10px; }
+  dialog input { font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+                 background: var(--bg); color: var(--text); }
+  dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+  dialog .row button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+                       background: var(--chip); color: var(--text); cursor: pointer; }
+  dialog .row button.primary { background: var(--accent); color: #1d1b16; border-color: var(--accent); font-weight: 600; }
+  dialog .preview { font-size: 13px; margin: 2px 0 8px; }
 </style>
 </head>
 <body>
@@ -87,6 +117,37 @@
 </div>
 
 <div class="banner" id="banner"></div>
+
+<section class="recs">
+  <div class="recs-head">
+    <h2>Recommended trades</h2>
+    <label>GE slots <input id="slots" type="number" min="1" max="8" value="8"></label>
+    <label>Margin checks valid for (min) <input id="checkttl" type="number" min="1" value="30"></label>
+    <span class="dim" style="font-size:12px">Uses your budget above. Click <b>Check</b> after buying 1 and selling 1 to use real prices.</span>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>Item</th><th>Buy</th><th>Sell at</th><th>Cost</th><th>Exp. profit</th><th>Prices from</th><th></th></tr></thead>
+    <tbody id="recrows"></tbody>
+  </table>
+  <div class="empty" id="recempty" hidden>No recommendations with these filters.</div>
+  <div class="total" id="rectotal"></div>
+</section>
+
+<dialog id="chk">
+  <form method="dialog" id="chkform">
+    <h3 id="chkname">Margin check</h3>
+    <p>Buy 1 well above the price (it fills instantly at the real current buy price), then sell it well below
+       (it fills at the real sell price). Enter what you actually paid and received.</p>
+    <label>I bought 1 for (gp)<input id="chkbought" type="text" inputmode="numeric" autocomplete="off"></label>
+    <label>I sold 1 for (gp)<input id="chksold" type="text" inputmode="numeric" autocomplete="off"></label>
+    <div class="preview" id="chkpreview"></div>
+    <div class="row">
+      <button value="clear" id="chkclear">Clear check</button>
+      <button value="cancel">Cancel</button>
+      <button value="save" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
 
 <div class="wrap">
   <table>
@@ -123,6 +184,40 @@ const COLS = [
 ];
 
 const $ = id => document.getElementById(id);
+const TAX_EXEMPT = new Set(["old school bond", "chisel", "gardening trowel", "glassblowing pipe", "hammer", "needle",
+  "pestle and mortar", "rake", "saw", "secateurs", "seed dibber", "shears", "spade", "watering can(0)"]);
+function tax(price, name) {
+  if (price < 50 || TAX_EXEMPT.has(name.toLowerCase())) return 0;
+  return Math.min(Math.floor(price * 0.02), 5e6);
+}
+
+// Manual margin checks, per economy: { itemId: { bought, sold, at } }. "bought" = what you paid buying 1
+// instantly (the real sell target); "sold" = what you got selling 1 instantly (the real buy target).
+let CHECKS = {};
+function loadChecks() { try { CHECKS = JSON.parse(localStorage.getItem("merch:checks:" + game)) || {}; } catch (e) { CHECKS = {}; } }
+function saveChecks() { try { localStorage.setItem("merch:checks:" + game, JSON.stringify(CHECKS)); } catch (e) {} }
+function freshCheck(id) {
+  const c = CHECKS[id];
+  return c && (Date.now() - c.at) / 60000 <= (+$("checkttl").value || 30) ? c : null;
+}
+
+// A row with any fresh margin check applied, plus units/potential for the budget.
+function effective(f, budget) {
+  const e = Object.assign({}, f);
+  const c = freshCheck(f.item_id);
+  if (c) {
+    if (c.bought) e.sell = c.bought;
+    if (c.sold) e.buy = c.sold;
+    e.tax = tax(e.sell, f.name);
+    e.margin = e.sell - e.tax - e.buy;
+    e.roi = e.margin / e.buy;
+    e.checked = c;
+    e.buy_age_s = e.sell_age_s = Math.floor((Date.now() - c.at) / 1000);
+  }
+  e.units = budget ? Math.min(f.max_units, Math.floor(budget / e.buy)) : f.max_units;
+  e.potential = Math.max(0, e.margin) * e.units;
+  return e;
+}
 const params = new URLSearchParams(location.search);
 let game = params.get("game") || "hardcore";
 let sortKey = "potential", sortAsc = false, data = null, nextRefresh = 0, inflight = false;
@@ -189,13 +284,11 @@ function render() {
   const maxroi = (+$("maxroi").value || 1e9) / 100;
   const f2p = $("f2p").checked;
 
-  let rows = data.flips.filter(f =>
-    f.vol_24h >= minvol && f.age_s <= maxage && f.roi <= maxroi && f.buy >= minprice &&
-    (!f2p || !f.members) && (!q || f.name.toLowerCase().includes(q)));
-  for (const f of rows) {
-    f.units = budget ? Math.min(f.max_units, Math.floor(budget / f.buy)) : f.max_units;
-    f.potential = f.margin * f.units;
-  }
+  const all = data.flips.map(f => effective(f, budget)).filter(f =>
+    f.vol_24h >= minvol && f.buy >= minprice && (!f2p || !f.members) &&
+    (f.checked || (f.margin > 0 && f.age_s <= maxage && f.roi <= maxroi)));
+  renderRecs(all, budget);
+  let rows = all.filter(f => !q || f.name.toLowerCase().includes(q));
   rows.sort((a, b) => {
     const x = a[sortKey], y = b[sortKey];
     const r = typeof x === "string" ? x.localeCompare(y) : (x ?? -Infinity) - (y ?? -Infinity);
@@ -219,6 +312,7 @@ function render() {
         if (f.members) td.append(el("span", { className: "tag", textContent: "P2P" }));
         if (f.trusted_price) td.append(el("span", { className: "tag ok", textContent: "confirmed",
           title: "Median confirmed price: " + gp(f.trusted_price) }));
+        td.append(checkButton(f));
       } else if (c.key === "book") {
         td.textContent = (f.best_bid || f.best_ask) ? gp(f.best_bid) + " / " + gp(f.best_ask) : "–";
         td.title = f.bids + " open buy offers, " + f.asks + " open sell offers";
@@ -233,6 +327,7 @@ function render() {
         td.textContent = c.gp ? gp(v) : c.fmt ? c.fmt(v) : v;
         if (c.cls) td.classList.add(c.cls);
         if (c.dim) td.classList.add("dim");
+        if (c.key === "margin" && v <= 0) td.className = "neg";
         if (c.bar) { td.classList.add("bar"); td.prepend(el("i", { style: `width:${100 * f.potential / maxPot}%` })); }
       }
       tr.append(td);
@@ -241,6 +336,95 @@ function render() {
   }
   $("empty").hidden = rows.length > 0;
 }
+
+function checkButton(f) {
+  const b = el("button", { className: "chk" + (f.checked ? " done" : ""), type: "button",
+    textContent: f.checked ? "✓ checked" : "Check",
+    title: f.checked ? `You bought 1 for ${gp(f.checked.bought)} and sold 1 for ${gp(f.checked.sold)}` : "Enter a margin check" });
+  b.onclick = () => openCheck(f);
+  return b;
+}
+
+// Pick up to N GE slots: rank by expected profit using a conservative margin (the lower of the current
+// and 24h-average margins unless you margin-checked the item), then fill slots greedily within budget.
+function renderRecs(rows, budget) {
+  const slots = Math.max(1, Math.min(8, +$("slots").value || 8));
+  const cands = rows
+    .filter(r => r.margin > 0 && r.units > 0 && (r.checked || r.avg_margin == null || r.avg_margin > 0))
+    .map(r => {
+      const m = r.checked || r.avg_margin == null ? r.margin : Math.min(r.margin, r.avg_margin);
+      return Object.assign({}, r, { conf_margin: m });
+    })
+    .sort((a, b) => b.conf_margin * b.units - a.conf_margin * a.units);
+  let left = budget || Infinity;
+  const picks = [];
+  for (const c of cands) {
+    if (picks.length >= slots) break;
+    const units = Math.min(c.units, Math.floor(left / c.buy));
+    if (units <= 0) continue;
+    picks.push(Object.assign(c, { units, cost: units * c.buy, profit: units * c.conf_margin }));
+    left -= units * c.buy;
+  }
+  const body = $("recrows"); body.replaceChildren();
+  picks.forEach((p, i) => {
+    const age = p.checked ? Math.floor((Date.now() - p.checked.at) / 60000) : null;
+    const src = p.checked
+      ? el("span", { className: "src-ok", textContent: `your check, ${age}m ago` })
+      : el("span", { className: "src-old", textContent: data.server_time
+          ? `server data, ~${ago(p.age_s)} old`
+          : "server" });
+    const tr = el("tr", {},
+      el("td", { className: "rank", textContent: i + 1 }),
+      el("td", { textContent: p.name }),
+      el("td", { textContent: `${p.units.toLocaleString()} @ ${p.buy.toLocaleString()}` }),
+      el("td", { textContent: p.sell.toLocaleString() }),
+      el("td", { textContent: gp(p.cost) }),
+      el("td", { className: "m", textContent: gp(p.profit) }),
+      el("td", {}, src),
+      el("td", {}, checkButton(p)));
+    body.append(tr);
+  });
+  $("recempty").hidden = picks.length > 0;
+  const cost = picks.reduce((s, p) => s + p.cost, 0), prof = picks.reduce((s, p) => s + p.profit, 0);
+  $("rectotal").replaceChildren(...(picks.length ? [
+    "Total: ", el("b", { textContent: gp(cost) }), " invested → ", el("b", { textContent: gp(prof) }),
+    " expected profit per 4h cycle" + (budget ? ` (${gp(Math.max(0, budget - cost))} of budget unused).` : ".")] : []));
+}
+
+let checking = null;
+function openCheck(f) {
+  checking = f;
+  const c = CHECKS[f.item_id];
+  $("chkname").textContent = "Margin check: " + f.name;
+  $("chkbought").value = c?.bought ?? "";
+  $("chksold").value = c?.sold ?? "";
+  $("chkbought").placeholder = "server: " + (data.flips.find(x => x.item_id === f.item_id)?.sell ?? "").toLocaleString();
+  $("chksold").placeholder = "server: " + (data.flips.find(x => x.item_id === f.item_id)?.buy ?? "").toLocaleString();
+  updatePreview();
+  $("chk").showModal();
+  $("chkbought").focus();
+}
+function updatePreview() {
+  if (!checking) return;
+  const b = parseGp($("chkbought").value), s = parseGp($("chksold").value);
+  if (!b || !s) { $("chkpreview").textContent = ""; return; }
+  const t = tax(b, checking.name), m = b - t - s;
+  $("chkpreview").textContent = `Margin after ${gp(t)} tax: ${m.toLocaleString()} gp per item` +
+    (m <= 0 ? " — no profit at these prices, it will drop out of the recommendations." : "");
+  $("chkpreview").className = "preview " + (m > 0 ? "m" : "warn");
+}
+$("chkbought").addEventListener("input", updatePreview);
+$("chksold").addEventListener("input", updatePreview);
+$("chk").addEventListener("close", () => {
+  const v = $("chk").returnValue;
+  if (checking && v === "save") {
+    const b = parseGp($("chkbought").value), s = parseGp($("chksold").value);
+    if (b || s) CHECKS[checking.item_id] = { bought: b || null, sold: s || null, at: Date.now() };
+  } else if (checking && v === "clear") {
+    delete CHECKS[checking.item_id];
+  }
+  saveChecks(); checking = null; render();
+});
 
 function renderBanner() {
   const b = $("banner"); b.replaceChildren();
@@ -286,7 +470,7 @@ async function load(force = false) {
 }
 
 function setGame(g) {
-  game = g; data = null;
+  game = g; data = null; loadChecks();
   history.replaceState(null, "", "?game=" + g);
   document.body.classList.toggle("hc", g === "hardcore");
   for (const b of document.querySelectorAll("#games button")) b.classList.toggle("on", b.dataset.game === g);
@@ -297,6 +481,11 @@ for (const b of document.querySelectorAll("#games button")) b.onclick = () => se
 for (const id of ["q","budget","minvol","maxage","minprice","maxroi","f2p"])
   $(id).addEventListener("input", () => { saveFilters(); render(); });
 $("refresh").onclick = () => load(true);
+for (const id of ["slots", "checkttl"]) {
+  try { const v = localStorage.getItem("merch:" + id); if (v) $(id).value = v; } catch (e) {}
+  $(id).addEventListener("input", () => { try { localStorage.setItem("merch:" + id, $(id).value); } catch (e) {} render(); });
+}
+setInterval(render, 30000);  // margin checks age out
 setInterval(() => { if ($("auto").checked && Date.now() >= nextRefresh && !document.hidden) load(); }, 5000);
 setGame(game);
 </script>
