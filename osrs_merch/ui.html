@@ -98,7 +98,7 @@
 
 <footer>
   Buy at = recent price sellers received (place your buy here or slightly above). Sell at = recent price buyers paid.
-  Margin is after 2% GE tax. 4h profit = margin × units you can realistically move in one buy-limit window
+  Buy seen / Sell seen = how long ago those two prices last traded. Margin is after 2% GE tax. 4h profit = margin × units you can realistically move in one buy-limit window
   (capped by buy limit, ~25% of the thinner side's flow, and your budget). Always price-check with a quick buy/sell before
   committing a full limit. <span class="hc-only">Hardcore prices come from players running the Hardcore World Tool Kit
   RuneLite plugin, so coverage is partial; "confirmed" means trades from established players at a normal price.</span>
@@ -117,7 +117,8 @@ const COLS = [
   { key: "book",      label: "Book bid / ask", hc: true, sortable: false },
   { key: "units",     label: "Units / 4h", fmt: v => v.toLocaleString() },
   { key: "potential", label: "4h profit", gp: true, cls: "pot", bar: true },
-  { key: "age_s",     label: "Last trade", fmt: ago, asc: true },
+  { key: "buy_age_s",  label: "Buy seen",  fmt: ago, asc: true, dim: true },
+  { key: "sell_age_s", label: "Sell seen", fmt: ago, asc: true, dim: true },
 ];
 
 const $ = id => document.getElementById(id);
@@ -221,6 +222,11 @@ function render() {
         td.textContent = (f.best_bid || f.best_ask) ? gp(f.best_bid) + " / " + gp(f.best_ask) : "–";
         td.title = f.bids + " open buy offers, " + f.asks + " open sell offers";
         td.className = "dim";
+        if (f.best_bid && f.best_ask && f.best_bid >= f.best_ask) {
+          // A live GE would match these instantly, so at least one side is a stale offer.
+          td.className = "warn";
+          td.title += ". Bid is at or above ask: these offers can't both be live (stale data).";
+        }
       } else {
         const v = f[c.key];
         td.textContent = c.gp ? gp(v) : c.fmt ? c.fmt(v) : v;
@@ -243,6 +249,14 @@ function renderBanner() {
   const sr = data.swap_rate;
   if (sr && sr.main && sr.hardcore) parts.push(el("span", {}, " Bond: ", el("b", { textContent: gp(sr.hardcore) }),
     " here vs ", el("b", { textContent: gp(sr.main) }), ` on main game (1 Hardcore gp ≈ ${(sr.main / sr.hardcore).toFixed(1)} main gp).`));
+  if (data.newest_trade_age_s != null) parts.push(el("span", { className: "dim" },
+    ` Newest trade in the data: ${ago(data.newest_trade_age_s)} ago.`));
+  if (data.server_time) {
+    const lag = data.fetched_at - data.server_time;
+    if (Math.abs(lag) > 120) parts.push(el("div", { className: "warn", textContent:
+      `Server snapshot time differs from your computer's clock by ${ago(Math.abs(lag))}` +
+      (lag > 0 ? " (server data is behind, or your clock is ahead)." : " (your clock is behind).") }));
+  }
   for (const w of data.warnings || []) parts.push(el("div", { className: "warn", textContent: w }));
   b.append(...parts);
 }

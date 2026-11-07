@@ -88,6 +88,8 @@ class Flip:
     max_units: int        # units you can realistically move per 4h limit window
     potential: int        # margin * max_units
     age_s: int            # staleness of the older of the two trades
+    buy_age_s: int        # seconds since the trade behind 'buy' (someone sold at that price)
+    sell_age_s: int       # seconds since the trade behind 'sell' (someone bought at that price)
     members: bool
     icon: str | None
     best_bid: int | None
@@ -119,9 +121,13 @@ def wiki_quotes(game: str, ua: str) -> list[Quote]:
     return out
 
 
-def hardcore_quotes(ua: str, base: str = HC_SERVER) -> list[Quote]:
+def hardcore_raw(ua: str, base: str = HC_SERVER) -> dict:
     q = urllib.parse.urlencode({"world": HC_ECONOMY, "include": "trust,fill"})
-    items = fetch_json(f"{base}/v1/items?{q}", ua).get("items") or []
+    return fetch_json(f"{base}/v1/items?{q}", ua)
+
+
+def hardcore_quotes(ua: str, base: str = HC_SERVER, raw: dict | None = None) -> list[Quote]:
+    items = (raw if raw is not None else hardcore_raw(ua, base)).get("items") or []
     out = []
     for s in items:
         # Prefer live fills over imported GE-history rows (which have no real time).
@@ -181,6 +187,7 @@ def build_flips(quotes: list[Quote], mapping: dict[int, dict], now: float,
             margin=margin, roi=margin / q.buy_ref, limit=limit, vol_24h=q.vol_24h,
             max_units=units, potential=margin * units,
             age_s=max(0, int(now - min(q.sell_time, q.buy_time))),
+            buy_age_s=max(0, int(now - q.buy_time)), sell_age_s=max(0, int(now - q.sell_time)),
             members=bool(m.get("members")), icon=m.get("icon"),
             best_bid=q.best_bid, best_ask=q.best_ask, bids=q.bids, asks=q.asks,
             trusted_price=q.trusted_price,
@@ -211,9 +218,20 @@ def scan(game: str, ua: str = DEFAULT_UA) -> dict:
     except Exception as e:
         mapping = {}
         warnings.append(f"Wiki item mapping unavailable ({e}); no buy limits/icons.")
-    quotes = hardcore_quotes(ua) if game == "hardcore" else wiki_quotes(game, ua)
-    flips = build_flips(quotes, mapping, time.time())
-    result = {"game": game, "fetched_at": int(time.time()), "items_seen": len(quotes),
+    server_time = None
+    if game == "hardcore":
+        raw = hardcore_raw(ua)
+        server_time = raw.get("time")
+        if server_time and server_time > 1e11:  # milliseconds
+            server_time //= 1000
+        quotes = hardcore_quotes(ua, raw=raw)
+    else:
+        quotes = wiki_quotes(game, ua)
+    now = time.time()
+    flips = build_flips(quotes, mapping, now)
+    newest = max((max(q.buy_time, q.sell_time) for q in quotes), default=None)
+    result = {"game": game, "fetched_at": int(now), "items_seen": len(quotes),
+              "server_time": server_time, "newest_trade_age_s": int(now - newest) if newest else None,
               "flips": [asdict(f) for f in flips], "defaults": DEFAULTS[game],
               "warnings": warnings, "swap_rate": None}
     if game == "hardcore":
@@ -256,6 +274,27 @@ def render(flips, top: int) -> str:
             f"{fmt_gp(f.margin):>8}{f.roi*100:>6.1f}%{(f.limit or 0):>7}{fmt_gp(f.vol_24h):>8}"
             f"{fmt_gp(f.potential):>9}{fmt_age(f.age_s):>6}")
     return "\n".join(lines)
+
+
+def run_debug(args) -> int:
+    """Print the raw Hardcore server data for items matching a name, with local-clock ages."""
+    raw = hardcore_raw(args.user_agent)
+    now = int(time.time())
+    print(f"Your computer's clock: {now} ({time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    st = raw.get("time")
+    print(f"Server 'time' field:   {st}" + (f"  (differs from your clock by {now - st}s)" if isinstance(st, int) and st < 1e11 else ""))
+    items = raw.get("items") or []
+    times = [v for s in items for k, v in s.items() if k.endswith("Time") and isinstance(v, (int, float))]
+    if times:
+        print(f"Items: {len(items)}. Newest timestamp in the whole response: {int(now - max(times))}s ago")
+    want = args.debug.lower()
+    for s in items:
+        if want in (s.get("name") or "").lower():
+            print("\n" + json.dumps(s, indent=2))
+            for k, v in s.items():
+                if k.endswith("Time") and v:
+                    print(f"  {k:<18} = {fmt_age(max(0, now - int(v)))} ago")
+    return 0
 
 
 def run_cli(args) -> int:
@@ -362,8 +401,11 @@ def main(argv=None):
     ap.add_argument("--min-volume", type=int, help="(cli) min units traded in 24h")
     ap.add_argument("--f2p", action="store_true", help="(cli) free-to-play items only")
     ap.add_argument("--loop", type=int, metavar="SECONDS", help="(cli) rescan every N seconds")
+    ap.add_argument("--debug", metavar="NAME", help="print raw Hardcore server data for items matching NAME")
     ap.add_argument("--user-agent", default=DEFAULT_UA)
     args = ap.parse_args(argv)
+    if args.debug:
+        return run_debug(args)
     return run_cli(args) if args.cli else run_ui(args)
 
 

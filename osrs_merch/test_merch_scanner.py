@@ -60,6 +60,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(whip.margin, 300_000 - 6_000 - 280_000)
         self.assertEqual(whip.max_units, 25)          # 600 per side / 6 * 0.25
         self.assertEqual(whip.age_s, 120)
+        self.assertEqual((whip.buy_age_s, whip.sell_age_s), (120, 60))
         self.assertEqual(flips[2].margin, 50_000)     # bonds are tax exempt
         self.assertEqual(flips[2].max_units, 10)
 
@@ -78,6 +79,7 @@ class Tests(unittest.TestCase):
                 data = json.load(urllib.request.urlopen(base + "/api/flips?game=hardcore"))
                 self.assertEqual(len(data["flips"]), 2)
                 self.assertEqual(data["swap_rate"]["hardcore"], 1_000_000)
+                self.assertEqual(data["server_time"], NOW)
             finally:
                 srv.shutdown()
 
